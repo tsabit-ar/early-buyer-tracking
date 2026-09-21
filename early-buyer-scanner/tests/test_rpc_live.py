@@ -167,3 +167,130 @@ def test_same_block_sniper_tagging(memory_db):
     assert sniper_map["Wallet22222222222222222222222222222222222"] is True
     assert sniper_map["Wallet33333333333333333333333333333333333"] is False
 
+
+def test_resolve_launch_time_backward_pagination(memory_db):
+    """Verify resolve_launch_time paginates backwards using 'before' to reach absolute genesis."""
+    from collectors.token import resolve_launch_time
+
+    mock_client = MagicMock()
+    # Batch 1 (1000 items, newest): last signature is 'sig_mid'
+    batch_1 = [{"signature": f"sig_recent_{i}", "blockTime": 1789960000} for i in range(999)]
+    batch_1.append({"signature": "sig_mid", "blockTime": 1789955000})
+
+    # Batch 2 (<1000 items, genesis): oldest signature is 'sig_genesis'
+    batch_2 = [
+        {"signature": "sig_early", "blockTime": 1789953000},
+        {"signature": "sig_genesis", "blockTime": 1789952445},
+    ]
+
+    def mock_get_sigs(address, limit=1000, before=None):
+        if before is None:
+            return batch_1
+        elif before == "sig_mid":
+            return batch_2
+        return []
+
+    mock_client.get_signatures_for_address.side_effect = mock_get_sigs
+
+    mint = "TokenMint1111111111111111111111111111111111"
+    launch_time, confidence = resolve_launch_time(mint, client=mock_client, db=memory_db)
+
+    assert launch_time == 1789952445
+    assert confidence == ConfidenceEnum.HIGH.value
+
+    # Verify persisted to SQLite
+    token = memory_db.get_token(mint)
+    assert token is not None
+    assert token.launch_time == 1789952445
+    assert token.launch_confidence == ConfidenceEnum.HIGH
+
+
+def test_resolve_launch_time_sqlite_idempotency(memory_db):
+    """Verify resolve_launch_time returns existing valid launch_time from DB without calling RPC."""
+    from collectors.token import resolve_launch_time
+    from models.schemas import TokenMetadata
+
+    mint = "TokenMint1111111111111111111111111111111111"
+    memory_db.save_token(
+        TokenMetadata(
+            token_address=mint,
+            launch_time=1789952445,
+            launch_confidence=ConfidenceEnum.HIGH,
+        )
+    )
+
+    mock_client = MagicMock()
+    mock_client.get_signatures_for_address.side_effect = RuntimeError("Should not be called!")
+
+    launch_time, confidence = resolve_launch_time(mint, client=mock_client, db=memory_db)
+
+    assert launch_time == 1789952445
+    assert confidence == ConfidenceEnum.HIGH.value
+    assert mock_client.get_signatures_for_address.call_count == 0
+
+
+def test_collect_historical_transfers_genesis_order(memory_db):
+    """Verify collect_historical_transfers orders transactions starting from genesis forward."""
+    from collectors.transfers import collect_historical_transfers
+
+    mock_client = MagicMock()
+    # Batch 1 (recent): sig3, sig4
+    batch_1 = [
+        {"signature": "sig4", "blockTime": 1789952500},
+        {"signature": "sig3", "blockTime": 1789952480},
+    ]
+    # For test simplicity, let's say batch_1 is 1000 items so it queries before="sig3"
+    batch_1_full = [{"signature": f"sig_pad_{i}", "blockTime": 1789952500} for i in range(998)]
+    batch_1_full.extend([
+        {"signature": "sig4", "blockTime": 1789952500},
+        {"signature": "sig3", "blockTime": 1789952480},
+    ])
+    # Batch 2 (genesis batch, <1000 items): sig2, sig1 (sig1 is genesis)
+    batch_2 = [
+        {"signature": "sig2", "blockTime": 1789952460},
+        {"signature": "sig1", "blockTime": 1789952445},
+    ]
+
+    def mock_get_sigs(address, limit=1000, before=None):
+        if before is None:
+            return batch_1_full
+        elif before == "sig3":
+            return batch_2
+        return []
+
+    mock_client.get_signatures_for_address.side_effect = mock_get_sigs
+
+    # Mock get_transaction_detail
+    def mock_get_detail(sig):
+        return {
+            "data": {
+                "signer": ["Signer11111111111111111111111111111111111"],
+                "token_bal_change": [
+                    {
+                        "token_address": "TokenMint1111111111111111111111111111111111",
+                        "address": f"Buyer_{sig}",
+                        "change": 100.0,
+                        "decimals": 9,
+                    }
+                ],
+            }
+        }
+
+    mock_client.get_transaction_detail.side_effect = mock_get_detail
+
+    mint = "TokenMint1111111111111111111111111111111111"
+    transfers = collect_historical_transfers(
+        mint_address=mint,
+        max_transfers=2,
+        client=mock_client,
+        db=memory_db,
+    )
+
+    assert len(transfers) == 2
+    # sig1 is absolute genesis (oldest), then sig2
+    assert transfers[0].signature == "sig1"
+    assert transfers[0].block_time == 1789952445
+    assert transfers[1].signature == "sig2"
+    assert transfers[1].block_time == 1789952460
+
+

@@ -284,6 +284,17 @@ def resolve_launch_time(
     valid_mint = validate_solana_address(mint_address)
     active_db = db or Database(settings.sqlite_db_path)
     
+    # 1. Check existing DB record for valid launch_time (SQLite Idempotency)
+    existing = active_db.get_token(valid_mint)
+    if existing and existing.launch_time and existing.launch_time > 0:
+        conf_val = (
+            existing.launch_confidence.value
+            if hasattr(existing.launch_confidence, "value")
+            else str(existing.launch_confidence)
+        )
+        logger.info(f"Using cached launch time for {valid_mint}: {existing.launch_time} ({conf_val})")
+        return existing.launch_time, conf_val
+
     if client is None:
         from api.solana_rpc import SolanaRpcClient
         active_client = SolanaRpcClient(database=active_db)
@@ -296,17 +307,22 @@ def resolve_launch_time(
     # If client has native Solana RPC get_signatures_for_address
     if hasattr(active_client, "get_signatures_for_address"):
         try:
-            sigs = active_client.get_signatures_for_address(valid_mint, limit=1000)
-            if sigs and len(sigs) > 0:
-                # Signatures are returned in reverse chronological order (newest first).
-                # The last signature in the list is the earliest in this block range!
-                oldest = sigs[-1]
-                bt = oldest.get("blockTime")
-                if bt is not None:
-                    launch_time = int(bt)
-                    launch_confidence = ConfidenceEnum.HIGH.value
-        except Exception:
-            pass
+            before = None
+            oldest_sig_info = None
+            while True:
+                batch = active_client.get_signatures_for_address(valid_mint, limit=1000, before=before)
+                if not batch:
+                    break
+                oldest_sig_info = batch[-1]
+                if len(batch) < 1000:
+                    break
+                before = oldest_sig_info.get("signature")
+
+            if oldest_sig_info and oldest_sig_info.get("blockTime") is not None:
+                launch_time = int(oldest_sig_info["blockTime"])
+                launch_confidence = ConfidenceEnum.HIGH.value
+        except Exception as exc:
+            logger.warning(f"Error resolving launch time via Solana RPC: {exc}")
 
     # If client has get_token_transfers (Solscan fallback)
     elif hasattr(active_client, "get_token_transfers"):

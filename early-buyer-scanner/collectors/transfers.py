@@ -109,85 +109,95 @@ def collect_historical_transfers(
 
     # Branch 1: Solana Native RPC client
     if hasattr(active_client, "get_signatures_for_address"):
-        # Fetch signatures for the mint address
-        raw_sigs = active_client.get_signatures_for_address(
-            valid_mint,
-            limit=min(1000, max(max_transfers * 10, 200)),
-        )
-        if not raw_sigs:
+        # Step backwards through signature pages to locate genesis and early transaction batches
+        batches: List[List[Dict[str, Any]]] = []
+        before = None
+        while True:
+            batch = active_client.get_signatures_for_address(valid_mint, limit=1000, before=before)
+            if not batch:
+                break
+            batches.append(batch)
+            if len(batch) < 1000:
+                break
+            before = batch[-1].get("signature")
+
+        if not batches:
             return []
 
-        # Reverse so earliest signatures are processed first (chronological order)
-        chronological_sigs = raw_sigs[::-1]
+        # Chronological signatures start from genesis batch (batches[-1]) reversed,
+        # then batches[-2] reversed, etc.
+        for batch in reversed(batches):
+            for sig_info in reversed(batch):
+                if len(collected_transfers) >= max_transfers:
+                    break
 
-        for sig_info in chronological_sigs:
+                sig = sig_info.get("signature")
+                if not sig or sig in seen_signatures:
+                    continue
+                seen_signatures.add(sig)
+
+                # Skip failed transactions if err is present
+                if sig_info.get("err"):
+                    continue
+
+                bt = sig_info.get("blockTime") or 0
+
+                # Fetch parsed transaction detail (cached in SQLite)
+                tx_data = active_client.get_transaction_detail(sig)
+                data_dict = tx_data.get("data", {})
+                token_changes = data_dict.get("token_bal_change", [])
+
+                # Filter changes for this token mint
+                relevant_changes = [
+                    tb for tb in token_changes
+                    if tb.get("token_address") == valid_mint
+                ]
+
+                if not relevant_changes:
+                    continue
+
+                # Identify recipient and sender
+                to_addr = ""
+                from_addr = data_dict.get("signer", [""])[0] if data_dict.get("signer") else ""
+                amount = 0.0
+                decs = 9
+
+                for tb in relevant_changes:
+                    chg = tb.get("change", 0.0)
+                    if chg > 0:
+                        to_addr = tb.get("address", "")
+                        amount = chg
+                        decs = tb.get("decimals", 9)
+                    elif chg < 0:
+                        from_addr = tb.get("address", from_addr)
+
+                if to_addr and amount > 0:
+                    event = TransferEvent(
+                        signature=sig,
+                        block_time=bt,
+                        from_address=from_addr,
+                        to_address=to_addr,
+                        token_address=valid_mint,
+                        amount=amount,
+                        decimals=decs,
+                        activity_type="transfer",
+                    )
+                    collected_transfers.append(event)
+
+                    # Persist to database
+                    active_db.save_wallet_event(
+                        wallet_address=to_addr,
+                        token_address=valid_mint,
+                        signature=sig,
+                        timestamp=bt,
+                        event_type="TRANSFER",
+                        amount=amount,
+                        quote_amount=0.0,
+                        confidence="LOW",
+                    )
+
             if len(collected_transfers) >= max_transfers:
                 break
-
-            sig = sig_info.get("signature")
-            if not sig or sig in seen_signatures:
-                continue
-            seen_signatures.add(sig)
-
-            # Skip failed transactions if err is present
-            if sig_info.get("err"):
-                continue
-
-            bt = sig_info.get("blockTime") or 0
-
-            # Fetch parsed transaction detail (cached in SQLite)
-            tx_data = active_client.get_transaction_detail(sig)
-            data_dict = tx_data.get("data", {})
-            token_changes = data_dict.get("token_bal_change", [])
-
-            # Filter changes for this token mint
-            relevant_changes = [
-                tb for tb in token_changes
-                if tb.get("token_address") == valid_mint
-            ]
-
-            if not relevant_changes:
-                continue
-
-            # Identify recipient and sender
-            to_addr = ""
-            from_addr = data_dict.get("signer", [""])[0] if data_dict.get("signer") else ""
-            amount = 0.0
-            decs = 9
-
-            for tb in relevant_changes:
-                chg = tb.get("change", 0.0)
-                if chg > 0:
-                    to_addr = tb.get("address", "")
-                    amount = chg
-                    decs = tb.get("decimals", 9)
-                elif chg < 0:
-                    from_addr = tb.get("address", from_addr)
-
-            if to_addr and amount > 0:
-                event = TransferEvent(
-                    signature=sig,
-                    block_time=bt,
-                    from_address=from_addr,
-                    to_address=to_addr,
-                    token_address=valid_mint,
-                    amount=amount,
-                    decimals=decs,
-                    activity_type="transfer",
-                )
-                collected_transfers.append(event)
-
-                # Persist to database
-                active_db.save_wallet_event(
-                    wallet_address=to_addr,
-                    token_address=valid_mint,
-                    signature=sig,
-                    timestamp=bt,
-                    event_type="TRANSFER",
-                    amount=amount,
-                    quote_amount=0.0,
-                    confidence="LOW",
-                )
 
         return collected_transfers
 
