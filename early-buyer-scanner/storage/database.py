@@ -42,6 +42,8 @@ class Database:
                 check_same_thread=False,
             )
             self._memory_conn.row_factory = sqlite3.Row
+        else:
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
         self.init_schema()
 

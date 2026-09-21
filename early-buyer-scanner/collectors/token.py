@@ -42,14 +42,14 @@ def validate_solana_address(address: str) -> str:
 
 def fetch_token_metadata(
     mint_address: str,
-    client: Optional[SolscanClient] = None,
+    client: Optional[Any] = None,
     db: Optional[Database] = None,
 ) -> TokenMetadata:
-    """Retrieve token metadata from Solscan API and persist to SQLite tokens table.
+    """Retrieve token metadata from RPC/Solscan and persist to SQLite tokens table.
     
     Args:
         mint_address: The Solana mint address.
-        client: Optional SolscanClient instance.
+        client: Optional SolanaRpcClient or SolscanClient instance.
         db: Optional Database instance.
         
     Returns:
@@ -57,29 +57,61 @@ def fetch_token_metadata(
     """
     valid_mint = validate_solana_address(mint_address)
     active_db = db or Database(settings.sqlite_db_path)
-    active_client = client or SolscanClient(database=active_db)
+    
+    if client is None:
+        from api.solana_rpc import SolanaRpcClient
+        active_client = SolanaRpcClient(database=active_db)
+    else:
+        active_client = client
 
-    raw_response = active_client.get_token_meta(valid_mint)
+    token_address = valid_mint
+    name = None
+    symbol = None
+    decimals_int = 9
+    creator = None
 
-    # Handle various response wrapper shapes from Solscan API
-    data: Dict[str, Any] = {}
-    if isinstance(raw_response, dict):
-        if "data" in raw_response and isinstance(raw_response["data"], dict):
-            data = raw_response["data"]
-        else:
-            data = raw_response
+    # If client has get_token_meta (Solscan)
+    if hasattr(active_client, "get_token_meta"):
+        try:
+            raw_response = active_client.get_token_meta(valid_mint)
+            data: Dict[str, Any] = {}
+            if isinstance(raw_response, dict):
+                if "data" in raw_response and isinstance(raw_response["data"], dict):
+                    data = raw_response["data"]
+                else:
+                    data = raw_response
 
-    # Extract metadata fields with safe fallbacks
-    token_address = data.get("address") or data.get("token_address") or valid_mint
-    name = data.get("name")
-    symbol = data.get("symbol")
-    decimals = data.get("decimals")
-    try:
-        decimals_int = int(decimals) if decimals is not None else 9
-    except (ValueError, TypeError):
-        decimals_int = 9
+            token_address = data.get("address") or data.get("token_address") or valid_mint
+            name = data.get("name")
+            symbol = data.get("symbol")
+            decimals = data.get("decimals")
+            if decimals is not None:
+                try:
+                    decimals_int = int(decimals)
+                except (ValueError, TypeError):
+                    decimals_int = 9
+            creator = data.get("creator") or data.get("owner") or data.get("authority")
+        except Exception:
+            pass
 
-    creator = data.get("creator") or data.get("owner") or data.get("authority")
+    # If client has native Solana RPC methods (get_token_supply, get_account_info)
+    if hasattr(active_client, "get_token_supply"):
+        try:
+            supply_data = active_client.get_token_supply(valid_mint)
+            if isinstance(supply_data, dict) and "decimals" in supply_data:
+                decimals_int = int(supply_data["decimals"])
+        except Exception:
+            pass
+
+    if hasattr(active_client, "get_account_info") and not creator:
+        try:
+            acc_info = active_client.get_account_info(valid_mint)
+            if isinstance(acc_info, dict) and "data" in acc_info:
+                d = acc_info["data"]
+                if isinstance(d, dict) and "parsed" in d:
+                    creator = d["parsed"].get("info", {}).get("mintAuthority")
+        except Exception:
+            pass
 
     # Check if we already have launch_time and launch_confidence stored
     existing = active_db.get_token(valid_mint)
@@ -102,14 +134,14 @@ def fetch_token_metadata(
 
 def resolve_launch_time(
     mint_address: str,
-    client: Optional[SolscanClient] = None,
+    client: Optional[Any] = None,
     db: Optional[Database] = None,
 ) -> Tuple[Optional[int], str]:
-    """Resolve token launch timestamp by querying the earliest historical transfer.
+    """Resolve token launch timestamp by querying the earliest historical transfer/signature.
     
     Args:
         mint_address: The Solana mint address.
-        client: Optional SolscanClient instance.
+        client: Optional SolanaRpcClient or SolscanClient instance.
         db: Optional Database instance.
         
     Returns:
@@ -117,45 +149,65 @@ def resolve_launch_time(
     """
     valid_mint = validate_solana_address(mint_address)
     active_db = db or Database(settings.sqlite_db_path)
-    active_client = client or SolscanClient(database=active_db)
-
-    # Query earliest transfer
-    resp = active_client.get_token_transfers(
-        token_address=valid_mint,
-        page=1,
-        page_size=1,
-        sort_by="block_time",
-        sort_order="asc",
-    )
-
-    items = []
-    if isinstance(resp, dict):
-        if "data" in resp:
-            data_val = resp["data"]
-            if isinstance(data_val, list):
-                items = data_val
-            elif isinstance(data_val, dict) and "items" in data_val:
-                items = data_val["items"]
-    elif isinstance(resp, list):
-        items = resp
+    
+    if client is None:
+        from api.solana_rpc import SolanaRpcClient
+        active_client = SolanaRpcClient(database=active_db)
+    else:
+        active_client = client
 
     launch_time: Optional[int] = None
     launch_confidence: str = ConfidenceEnum.LOW.value
 
-    if items and len(items) > 0:
-        first_tx = items[0]
-        bt = (
-            first_tx.get("block_time")
-            or first_tx.get("time")
-            or first_tx.get("blockTime")
+    # If client has native Solana RPC get_signatures_for_address
+    if hasattr(active_client, "get_signatures_for_address"):
+        try:
+            sigs = active_client.get_signatures_for_address(valid_mint, limit=1000)
+            if sigs and len(sigs) > 0:
+                # Signatures are returned in reverse chronological order (newest first).
+                # The last signature in the list is the earliest in this block range!
+                oldest = sigs[-1]
+                bt = oldest.get("blockTime")
+                if bt is not None:
+                    launch_time = int(bt)
+                    launch_confidence = ConfidenceEnum.HIGH.value
+        except Exception:
+            pass
+
+    # If client has get_token_transfers (Solscan fallback)
+    elif hasattr(active_client, "get_token_transfers"):
+        resp = active_client.get_token_transfers(
+            token_address=valid_mint,
+            page=1,
+            page_size=1,
+            sort_by="block_time",
+            sort_order="asc",
         )
-        if bt is not None:
-            try:
-                launch_time = int(bt)
-                launch_confidence = ConfidenceEnum.HIGH.value
-            except (ValueError, TypeError):
-                launch_time = None
-                launch_confidence = ConfidenceEnum.LOW.value
+        items = []
+        if isinstance(resp, dict):
+            if "data" in resp:
+                data_val = resp["data"]
+                if isinstance(data_val, list):
+                    items = data_val
+                elif isinstance(data_val, dict) and "items" in data_val:
+                    items = data_val["items"]
+        elif isinstance(resp, list):
+            items = resp
+
+        if items and len(items) > 0:
+            first_tx = items[0]
+            bt = (
+                first_tx.get("block_time")
+                or first_tx.get("time")
+                or first_tx.get("blockTime")
+            )
+            if bt is not None:
+                try:
+                    launch_time = int(bt)
+                    launch_confidence = ConfidenceEnum.HIGH.value
+                except (ValueError, TypeError):
+                    launch_time = None
+                    launch_confidence = ConfidenceEnum.LOW.value
 
     # Update or persist token with newly resolved launch time
     token_record = active_db.get_token(valid_mint)

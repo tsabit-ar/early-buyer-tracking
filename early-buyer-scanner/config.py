@@ -22,6 +22,15 @@ else:
 # ==========================================
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+
+# Known Quote Assets (WSOL, USDC, USDT)
+QUOTE_ASSET_MINTS: Set[str] = {
+    WSOL_MINT,
+    USDC_MINT,
+    USDT_MINT,
+}
 
 # System and Token Programs
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
@@ -91,15 +100,40 @@ EARLY_ENTRY_TIERS = [
 ]
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_db_path() -> Path:
+    raw = os.getenv("SQLITE_DB_PATH", "early_buyer.db")
+    if raw == ":memory:":
+        return Path(":memory:")
+    p = Path(raw)
+    if not p.is_absolute():
+        return PROJECT_ROOT / p
+    return p
+
+
+def _resolve_rpc_url() -> str:
+    custom_url = os.getenv("SOLANA_RPC_URL", "").strip()
+    if custom_url:
+        return custom_url
+    helius_key = os.getenv("HELIUS_API_KEY", "").strip()
+    if helius_key:
+        return f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
+    return "https://api.mainnet-beta.solana.com"
+
+
 @dataclass
 class Settings:
     """Application settings with environment variable fallbacks."""
 
+    solana_rpc_url: str = field(default_factory=_resolve_rpc_url)
+    helius_api_key: str = field(default_factory=lambda: os.getenv("HELIUS_API_KEY", ""))
     solscan_api_key: str = field(
         default_factory=lambda: os.getenv("SOLSCAN_API_KEY", "")
     )
     sqlite_db_path: Path = field(
-        default_factory=lambda: Path(os.getenv("SQLITE_DB_PATH", "early_buyer.db"))
+        default_factory=_resolve_db_path
     )
     request_timeout: float = field(
         default_factory=lambda: float(os.getenv("REQUEST_TIMEOUT", "30.0"))

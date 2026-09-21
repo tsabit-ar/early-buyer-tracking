@@ -8,7 +8,7 @@ Implements FR-07, Section 10, and Section 23 ("Evidence First, Score Second") of
 
 from typing import List
 
-from config import KNOWN_DEX_PROGRAMS, WSOL_MINT
+from config import KNOWN_DEX_PROGRAMS, QUOTE_ASSET_MINTS, USDC_MINT, USDT_MINT, WSOL_MINT
 from models.schemas import (
     ClassificationEnum,
     ConfidenceEnum,
@@ -19,6 +19,7 @@ from models.schemas import (
 # Fee threshold to prevent ordinary transfers from being misclassified as BUYs
 # Coincides with standard network transaction fee + rent-exempt ATA initialization allowance
 FEE_THRESHOLD_SOL: float = 0.003
+FEE_THRESHOLD_USD: float = 0.50
 
 
 def classify_transaction(
@@ -64,18 +65,39 @@ def classify_transaction(
             if tb.mint is None or tb.mint.strip() == clean_token:
                 token_change += tb.change
 
-    # 3. Compute Net Delta for Quote Asset (SOL + WSOL)
+    # 3. Compute Net Delta for Quote Assets (SOL, WSOL, USDC, USDT)
     sol_change: float = 0.0
     for sb in tx.sol_balance_changes:
         if sb.address.strip() == clean_wallet:
             sol_change += sb.change
 
     wsol_change: float = 0.0
+    usdc_change: float = 0.0
+    usdt_change: float = 0.0
     for tb in tx.token_balance_changes:
-        if tb.address.strip() == clean_wallet and tb.mint and tb.mint.strip() == WSOL_MINT:
-            wsol_change += tb.change
+        if tb.address.strip() == clean_wallet and tb.mint:
+            mint_addr = tb.mint.strip()
+            if mint_addr == WSOL_MINT:
+                wsol_change += tb.change
+            elif mint_addr == USDC_MINT:
+                usdc_change += tb.change
+            elif mint_addr == USDT_MINT:
+                usdt_change += tb.change
 
-    net_quote_change: float = sol_change + wsol_change
+    sol_quote_change: float = sol_change + wsol_change
+    usd_quote_change: float = usdc_change + usdt_change
+
+    # Determine primary quote asset change
+    if abs(usd_quote_change) > abs(sol_quote_change) and abs(usd_quote_change) > FEE_THRESHOLD_USD:
+        net_quote_change = usd_quote_change
+        quote_symbol = "USDC/USDT"
+        is_quote_spent = usd_quote_change < -FEE_THRESHOLD_USD
+        is_quote_received = usd_quote_change > FEE_THRESHOLD_USD
+    else:
+        net_quote_change = sol_quote_change
+        quote_symbol = "SOL/WSOL"
+        is_quote_spent = sol_quote_change < -FEE_THRESHOLD_SOL
+        is_quote_received = sol_quote_change > 0.001
 
     # 4. Check DEX/AMM Program Involvement
     detected_dex = [p for p in tx.programs if p in KNOWN_DEX_PROGRAMS]
@@ -87,11 +109,10 @@ def classify_transaction(
     # 5. Core Classification Logic (Evidence First)
 
     # Case A: BUY (Token Received + Significant Quote Asset Spent)
-    if token_change > 0 and net_quote_change < -FEE_THRESHOLD_SOL:
+    if token_change > 0 and is_quote_spent:
         reasons.append(f"Target token acquired: +{token_change:,.4f}")
         reasons.append(
-            f"Quote asset spent: {net_quote_change:.6f} SOL/WSOL "
-            f"(exceeds threshold -{FEE_THRESHOLD_SOL} SOL)"
+            f"Quote asset spent: {net_quote_change:.6f} {quote_symbol}"
         )
         confidence = ConfidenceEnum.HIGH if has_dex else ConfidenceEnum.MEDIUM
         return TransactionClassification(
@@ -108,9 +129,9 @@ def classify_transaction(
         )
 
     # Case B: SELL (Token Sent Out + Quote Asset Received)
-    if token_change < 0 and net_quote_change > 0.001:
+    if token_change < 0 and is_quote_received:
         reasons.append(f"Target token sold: {token_change:,.4f}")
-        reasons.append(f"Quote asset received: +{net_quote_change:.6f} SOL/WSOL")
+        reasons.append(f"Quote asset received: +{net_quote_change:.6f} {quote_symbol}")
         confidence = ConfidenceEnum.HIGH if has_dex else ConfidenceEnum.MEDIUM
         return TransactionClassification(
             signature=tx.signature,

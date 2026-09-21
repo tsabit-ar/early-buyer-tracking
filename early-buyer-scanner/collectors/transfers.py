@@ -1,13 +1,12 @@
 """Historical token transfers collector module for EBRS.
 
-Fetches chronological token transfers using pagination, converts raw Solscan
-payloads into Pydantic TransferEvent models, and persists them into SQLite.
+Fetches chronological token transfers using Solana Native RPC getSignaturesForAddress
+(or Solscan API fallback), parses transfer events, and persists them into SQLite.
 """
 
 import logging
 from typing import Any, Dict, List, Optional
 
-from api.solscan import SolscanClient
 from collectors.token import validate_solana_address
 from config import settings
 from models.schemas import TransferEvent
@@ -17,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_transfer_item(item: Dict[str, Any], default_token: str) -> Optional[TransferEvent]:
-    """Parse a single transfer record from Solscan into a TransferEvent model."""
+    """Parse a single transfer record from Solscan format into a TransferEvent model."""
     sig = (
         item.get("trans_id")
         or item.get("tx_hash")
@@ -81,16 +80,16 @@ def collect_historical_transfers(
     mint_address: str,
     max_transfers: int = 200,
     page_size: int = 50,
-    client: Optional[SolscanClient] = None,
+    client: Optional[Any] = None,
     db: Optional[Database] = None,
 ) -> List[TransferEvent]:
-    """Collect historical token transfers chronologically via pagination.
+    """Collect historical token transfers chronologically via Solana RPC or Solscan.
     
     Args:
         mint_address: Solana mint address.
         max_transfers: Maximum number of transfers to gather.
         page_size: Transfers per page request.
-        client: Optional SolscanClient instance.
+        client: Optional SolanaRpcClient or SolscanClient instance.
         db: Optional Database instance.
         
     Returns:
@@ -98,14 +97,103 @@ def collect_historical_transfers(
     """
     valid_mint = validate_solana_address(mint_address)
     active_db = db or Database(settings.sqlite_db_path)
-    active_client = client or SolscanClient(database=active_db)
+    
+    if client is None:
+        from api.solana_rpc import SolanaRpcClient
+        active_client = SolanaRpcClient(database=active_db)
+    else:
+        active_client = client
 
     collected_transfers: List[TransferEvent] = []
     seen_signatures = set()
-    page = 1
 
+    # Branch 1: Solana Native RPC client
+    if hasattr(active_client, "get_signatures_for_address"):
+        # Fetch signatures for the mint address
+        raw_sigs = active_client.get_signatures_for_address(
+            valid_mint,
+            limit=min(1000, max(max_transfers * 2, 50)),
+        )
+        if not raw_sigs:
+            return []
+
+        # Reverse so earliest signatures are processed first (chronological order)
+        chronological_sigs = raw_sigs[::-1]
+
+        for sig_info in chronological_sigs:
+            if len(collected_transfers) >= max_transfers:
+                break
+
+            sig = sig_info.get("signature")
+            if not sig or sig in seen_signatures:
+                continue
+            seen_signatures.add(sig)
+
+            # Skip failed transactions if err is present
+            if sig_info.get("err"):
+                continue
+
+            bt = sig_info.get("blockTime") or 0
+
+            # Fetch parsed transaction detail (cached in SQLite)
+            tx_data = active_client.get_transaction_detail(sig)
+            data_dict = tx_data.get("data", {})
+            token_changes = data_dict.get("token_bal_change", [])
+
+            # Filter changes for this token mint
+            relevant_changes = [
+                tb for tb in token_changes
+                if tb.get("token_address") == valid_mint
+            ]
+
+            if not relevant_changes:
+                continue
+
+            # Identify recipient and sender
+            to_addr = ""
+            from_addr = data_dict.get("signer", [""])[0] if data_dict.get("signer") else ""
+            amount = 0.0
+            decs = 9
+
+            for tb in relevant_changes:
+                chg = tb.get("change", 0.0)
+                if chg > 0:
+                    to_addr = tb.get("address", "")
+                    amount = chg
+                    decs = tb.get("decimals", 9)
+                elif chg < 0:
+                    from_addr = tb.get("address", from_addr)
+
+            if to_addr and amount > 0:
+                event = TransferEvent(
+                    signature=sig,
+                    block_time=bt,
+                    from_address=from_addr,
+                    to_address=to_addr,
+                    token_address=valid_mint,
+                    amount=amount,
+                    decimals=decs,
+                    activity_type="transfer",
+                )
+                collected_transfers.append(event)
+
+                # Persist to database
+                active_db.save_wallet_event(
+                    wallet_address=to_addr,
+                    token_address=valid_mint,
+                    signature=sig,
+                    timestamp=bt,
+                    event_type="TRANSFER",
+                    amount=amount,
+                    quote_amount=0.0,
+                    confidence="LOW",
+                )
+
+        return collected_transfers
+
+    # Branch 2: Solscan Pro fallback
+    page = 1
     while len(collected_transfers) < max_transfers:
-        # Respect remaining limit on last page request
         current_page_size = min(page_size, max_transfers - len(collected_transfers))
         if current_page_size <= 0:
             break
@@ -130,7 +218,6 @@ def collect_historical_transfers(
             items = resp
 
         if not items:
-            # End of transfer history reached
             break
 
         new_items_found = 0
@@ -139,18 +226,13 @@ def collect_historical_transfers(
                 continue
 
             event = _parse_transfer_item(raw_item, valid_mint)
-            if not event:
-                continue
-
-            # Avoid duplicates if overlapping pages occur
-            if event.signature in seen_signatures:
+            if not event or event.signature in seen_signatures:
                 continue
 
             seen_signatures.add(event.signature)
             collected_transfers.append(event)
             new_items_found += 1
 
-            # Persist transfer event to database
             active_db.save_wallet_event(
                 wallet_address=event.to_address,
                 token_address=event.token_address,
@@ -166,7 +248,6 @@ def collect_historical_transfers(
                 break
 
         if new_items_found == 0:
-            # No new unique items received on this page
             break
 
         page += 1

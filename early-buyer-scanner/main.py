@@ -24,6 +24,7 @@ from analyzers.candidate_generator import extract_candidate_wallets, filter_cand
 from analyzers.sell_analyzer import enrich_profile_with_sells
 from analyzers.transaction_classifier import classify_transaction
 from analyzers.wallet_analyzer import build_buyer_profile, format_time_delta
+from api.solana_rpc import SolanaRpcClient
 from api.solscan import SolscanClient
 from collectors.holders import get_token_holders_data
 from collectors.token import fetch_token_metadata, resolve_launch_time, validate_solana_address
@@ -383,7 +384,7 @@ def run_pipeline(
     logger.info(f"Initializing EBRS scanner for token: {valid_mint}")
 
     db = Database(settings.sqlite_db_path)
-    client = SolscanClient(database=db)
+    client = SolanaRpcClient(database=db)
 
     # 1. Fetch token metadata
     logger.info("Step 1: Fetching token metadata...")

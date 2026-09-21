@@ -7,9 +7,8 @@ and atomically persists new transaction records.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from api.solscan import SolscanClient
 from models.schemas import BalanceChange, TransactionDetail
 from storage.database import Database
 
@@ -174,7 +173,7 @@ def parse_solscan_tx_detail(raw_data: Dict[str, Any], signature: str) -> Transac
 
 def get_transaction_details_batch(
     signatures: List[str],
-    client: SolscanClient,
+    client: Any,
     db: Database,
 ) -> List[TransactionDetail]:
     """Retrieve on-chain transaction details for a list of signatures.
