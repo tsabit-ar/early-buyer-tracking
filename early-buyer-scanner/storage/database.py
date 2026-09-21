@@ -148,6 +148,13 @@ class Database:
                     score REAL DEFAULT 0.0,
                     confidence TEXT,
                     is_same_block_sniper INTEGER DEFAULT 0,
+                    funder_address TEXT,
+                    funder_type TEXT,
+                    wallet_age_days REAL,
+                    is_fresh INTEGER DEFAULT 0,
+                    funding_amount_sol REAL,
+                    funding_signature TEXT,
+                    cluster_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (wallet_address, token_address)
                 );
@@ -155,7 +162,18 @@ class Database:
             )
 
             # Migration for existing tables
-            for col, col_type in [("first_buy_slot", "INTEGER"), ("is_same_block_sniper", "INTEGER DEFAULT 0")]:
+            new_columns = [
+                ("first_buy_slot", "INTEGER"),
+                ("is_same_block_sniper", "INTEGER DEFAULT 0"),
+                ("funder_address", "TEXT"),
+                ("funder_type", "TEXT"),
+                ("wallet_age_days", "REAL"),
+                ("is_fresh", "INTEGER DEFAULT 0"),
+                ("funding_amount_sol", "REAL"),
+                ("funding_signature", "TEXT"),
+                ("cluster_id", "TEXT"),
+            ]
+            for col, col_type in new_columns:
                 try:
                     cursor.execute(f"ALTER TABLE wallet_profiles ADD COLUMN {col} {col_type};")
                 except sqlite3.OperationalError:
@@ -420,9 +438,11 @@ class Database:
                     wallet_address, token_address, first_buy_time, first_buy_slot, first_buy_signature,
                     first_buy_amount, time_after_launch, total_buy_amount, buy_count,
                     sell_count, total_sell_amount, current_holding, exit_ratio,
-                    holder_rank, holder_percentage, score, confidence, is_same_block_sniper
+                    holder_rank, holder_percentage, score, confidence, is_same_block_sniper,
+                    funder_address, funder_type, wallet_age_days, is_fresh, funding_amount_sol,
+                    funding_signature, cluster_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(wallet_address, token_address) DO UPDATE SET
                     first_buy_time = excluded.first_buy_time,
                     first_buy_slot = excluded.first_buy_slot,
@@ -439,7 +459,14 @@ class Database:
                     holder_percentage = excluded.holder_percentage,
                     score = excluded.score,
                     confidence = excluded.confidence,
-                    is_same_block_sniper = excluded.is_same_block_sniper;
+                    is_same_block_sniper = excluded.is_same_block_sniper,
+                    funder_address = excluded.funder_address,
+                    funder_type = excluded.funder_type,
+                    wallet_age_days = excluded.wallet_age_days,
+                    is_fresh = excluded.is_fresh,
+                    funding_amount_sol = excluded.funding_amount_sol,
+                    funding_signature = excluded.funding_signature,
+                    cluster_id = excluded.cluster_id;
                 """,
                 (
                     profile.wallet_address,
@@ -460,6 +487,13 @@ class Database:
                     profile.score,
                     profile.confidence.value,
                     1 if profile.is_same_block_sniper else 0,
+                    profile.funder_address,
+                    profile.funder_type,
+                    profile.wallet_age_days,
+                    1 if profile.is_fresh_wallet else 0,
+                    profile.funding_amount_sol,
+                    profile.funding_signature,
+                    profile.cluster_id,
                 ),
             )
 
@@ -498,6 +532,13 @@ class Database:
                         if r["confidence"]
                         else ConfidenceEnum.UNKNOWN,
                         is_same_block_sniper=bool(r["is_same_block_sniper"]) if "is_same_block_sniper" in col_keys else False,
+                        wallet_age_days=r["wallet_age_days"] if "wallet_age_days" in col_keys else None,
+                        is_fresh_wallet=bool(r["is_fresh"]) if "is_fresh" in col_keys else False,
+                        funder_address=r["funder_address"] if "funder_address" in col_keys else None,
+                        funder_type=r["funder_type"] if "funder_type" in col_keys and r["funder_type"] else "UNKNOWN",
+                        funding_amount_sol=r["funding_amount_sol"] if "funding_amount_sol" in col_keys else None,
+                        funding_signature=r["funding_signature"] if "funding_signature" in col_keys else None,
+                        cluster_id=r["cluster_id"] if "cluster_id" in col_keys else None,
                     )
                 )
             return profiles

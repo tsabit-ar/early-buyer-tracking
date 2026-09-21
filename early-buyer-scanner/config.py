@@ -79,6 +79,44 @@ KNOWN_NON_BUY_ADDRESSES: Set[str] = {
 }
 
 # ==========================================
+# KNOWN CEX HOT WALLETS (Solana Mainnet)
+# ==========================================
+
+KNOWN_CEX_WALLETS: Dict[str, str] = {
+    # Binance
+    "5tzFkiKscMRHK5ZXkrZXZ1RChPTyVC5yFsNuPaSkWCjd": "Binance",
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM": "Binance",
+    "2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S": "Binance",
+    # Coinbase
+    "H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS": "Coinbase",
+    "2AQdpHJ2JpcEgBtAZUXpqkWwdDTdy53T5YMQU45y4qHT": "Coinbase",
+    "GJRs4FwHtemZ5ZE9x3FNvJ83nPwm5kWsfGQ65sJUCwa7": "Coinbase",
+    # OKX
+    "5VCwKtCXgCJ6kit5FybXjvriW3xJMsFD897fDrx4wh9B": "OKX",
+    "6ZRCB7AAqGrepmKBZnnxrwifrWsKj5Kx4Pq7oZqZeaZ": "OKX",
+    # Bybit
+    "AC5RDfQFmDS1deWZos921qbhirGLTgFgSLmjmbBtx2x": "Bybit",
+    # MEXC
+    "ASTyfSima4LLAdEmpgA7ddJB69YKA2eE64YQCDPie2u": "MEXC",
+    # KuCoin
+    "BMbLwH2vE4FjQkY8c2B5oGqP2vY1nC6fK8X3vY1nC6f": "KuCoin",
+    # FixedFloat
+    "FCgXvN8H9a9cT2rUqJpXm3Kz7L9oQ1vW4yB8xZ5nE2r": "FixedFloat",
+    # Kraken
+    "FWznbcNXWQuHTawe9RxvQ2LdCENssh12dsznf4RiouN5": "Kraken",
+    # Gate.io
+    "u6PJ8DtQuqaeagbdrK9ceA2SZ42eeP5UV2U4ErqmNNN": "Gate.io",
+}
+
+# ==========================================
+# FUNDING & SYBIL DETECTION CONSTANTS
+# ==========================================
+
+MAX_FUNDING_PAGES: int = 3
+MATURE_WALLET_AGE_DAYS: float = 7.0
+MIN_CLUSTER_FUNDING_SOL: float = 0.05
+
+# ==========================================
 # DEFAULT SCORING WEIGHTS & PARAMETERS
 # ==========================================
 

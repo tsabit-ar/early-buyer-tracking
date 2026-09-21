@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from analyzers.candidate_generator import extract_candidate_wallets, filter_candidate_events
+from analyzers.funding_analyzer import detect_funder_clusters, trace_wallet_funder
 from analyzers.sell_analyzer import enrich_profile_with_sells
 from analyzers.transaction_classifier import classify_transaction
 from analyzers.wallet_analyzer import build_buyer_profile, format_time_delta, tag_same_block_snipers
@@ -30,7 +31,7 @@ from collectors.holders import get_token_holders_data
 from collectors.token import fetch_token_metadata, resolve_launch_time, validate_solana_address
 from collectors.transfers import collect_historical_transfers
 from collectors.transactions import get_transaction_details_batch
-from config import PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_V4_ID, SYSTEM_PROGRAM_ID, WSOL_MINT, settings
+from config import KNOWN_CEX_WALLETS, PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_V4_ID, SYSTEM_PROGRAM_ID, WSOL_MINT, settings
 from models.schemas import (
     BalanceChange,
     ClassificationEnum,
@@ -85,9 +86,9 @@ def print_executive_report(
     print(f"\nLaunch:\n{launch_str}")
     print(f"\nCandidates:\n{candidates_count}")
     print(f"\nLikely Buyers:\n{len(ranked_buyers)}")
-    print("\n" + "-" * 67)
-    print(f"{'RANK':<5} {'WALLET':<12} {'FIRST BUY':<11} {'SIZE':<12} {'HOLD':<8} {'SCORE':<6} {'TAG':<8}")
-    print("-" * 67)
+    print("\n" + "-" * 90)
+    print(f"{'RANK':<5} {'WALLET':<12} {'FIRST BUY':<11} {'SIZE':<10} {'HOLD':<6} {'AGE':<12} {'FUNDER':<18} {'SCORE':<6} {'TAG':<8}")
+    print("-" * 90)
 
     for rank, (p, _) in enumerate(ranked_buyers[:top_n], start=1):
         wallet_short = truncate_address(p.wallet_address, 4, 3)
@@ -99,22 +100,79 @@ def print_executive_report(
         hold_str = f"{retention_pct}%"
         tag_str = "[SNIPER]" if p.is_same_block_sniper else "-"
 
+        # Format age
+        if p.wallet_age_days is not None:
+            if p.wallet_age_days < 1/24:
+                m = max(1, int(p.wallet_age_days * 1440))
+                age_str = f"{m}m [FRESH]"
+            elif p.wallet_age_days < 1.0:
+                h = max(1, int(p.wallet_age_days * 24))
+                age_str = f"{h}h [FRESH]"
+            else:
+                age_str = f"{int(p.wallet_age_days)}d"
+        elif p.funder_type == "MATURE_WALLET":
+            age_str = ">7d"
+        else:
+            age_str = "N/A"
+
+        # Format funder
+        if p.funder_type == "CEX":
+            cex_name = KNOWN_CEX_WALLETS.get(p.funder_address, "CEX")
+            funder_str = f"{cex_name}"
+        elif p.funder_type == "INTERNAL":
+            funder_str = "Self-funded"
+        elif p.cluster_id:
+            short_funder = truncate_address(p.funder_address, 3, 2)
+            funder_str = f"{short_funder} [{p.cluster_id}]"
+        elif p.funder_address:
+            funder_str = truncate_address(p.funder_address, 4, 3)
+        elif p.funder_type == "MATURE_WALLET":
+            funder_str = "Mature"
+        else:
+            funder_str = "-"
+
         print(
-            f"{rank:<5} {wallet_short:<12} {time_rel:<11} {size_str:<12} {hold_str:<8} {int(p.score):<6} {tag_str:<8}"
+            f"{rank:<5} {wallet_short:<12} {time_rel:<11} {size_str:<10} {hold_str:<6} {age_str:<12} {funder_str:<18} {int(p.score):<6} {tag_str:<8}"
         )
-    print("-" * 67)
+    print("-" * 90)
 
     # Detailed view of #1 Buyer if available
     if ranked_buyers:
         top_buyer, breakdown = ranked_buyers[0]
         exit_pct = int(round(top_buyer.exit_ratio * 100))
         retention_pct = max(0, 100 - exit_pct)
+
+        if top_buyer.wallet_age_days is not None:
+            if top_buyer.wallet_age_days < 1/24:
+                top_age = f"{max(1, int(top_buyer.wallet_age_days * 1440))}m (FRESH)"
+            elif top_buyer.wallet_age_days < 1.0:
+                top_age = f"{max(1, int(top_buyer.wallet_age_days * 24))}h (FRESH)"
+            else:
+                top_age = f"{int(top_buyer.wallet_age_days)} days"
+        elif top_buyer.funder_type == "MATURE_WALLET":
+            top_age = "> 7 days (Mature)"
+        else:
+            top_age = "N/A"
+
+        if top_buyer.funder_type == "CEX":
+            top_funder = KNOWN_CEX_WALLETS.get(top_buyer.funder_address, "CEX")
+        elif top_buyer.funder_address:
+            top_funder = top_buyer.funder_address
+        else:
+            top_funder = "N/A"
+
         print("\nWallet Detail:")
         print(top_buyer.wallet_address)
         print(f"\nClassification: BUY")
         print(f"Confidence: {top_buyer.confidence.value}")
         if top_buyer.is_same_block_sniper:
             print(f"Sniper Status: [SNIPER] (Same-Block Entry, Slot: {top_buyer.first_buy_slot or 'N/A'})")
+        print(f"Wallet Age: {top_age}")
+        print(f"Funding Source: {top_funder} (Type: {top_buyer.funder_type})")
+        if top_buyer.funding_amount_sol is not None:
+            print(f"Initial Funding: {top_buyer.funding_amount_sol} SOL")
+        if top_buyer.cluster_id:
+            print(f"Sybil Cluster: [{top_buyer.cluster_id}]")
         print(f"\nFirst Buy:\n{format_time_delta(top_buyer.time_after_launch)}")
         print(f"\nFirst Buy Size:\n{top_buyer.first_buy_amount:,.2f} tokens")
         print(f"\nBuy Count:\n{top_buyer.buy_count}")
@@ -124,6 +182,8 @@ def print_executive_report(
         print(f"Transaction Signature: {top_buyer.first_buy_signature or 'N/A'}")
         if top_buyer.first_buy_slot is not None:
             print(f"Block Slot: {top_buyer.first_buy_slot}")
+        if top_buyer.funding_signature:
+            print(f"Funding Transaction: {top_buyer.funding_signature}")
         print(f"Score Breakdown: Early={breakdown.early_entry_score:.0f}, Size={breakdown.buy_size_score:.0f}, Acc={breakdown.accumulation_score:.0f}, Hold={breakdown.holding_score:.0f}")
         print("=" * 49 + "\n")
 
@@ -157,6 +217,12 @@ def export_reports(
                 "Total Sell Amount",
                 "Current Holding",
                 "Exit Ratio",
+                "Wallet Age Days",
+                "Is Fresh Wallet",
+                "Funder Address",
+                "Funder Type",
+                "Funding Amount SOL",
+                "Cluster ID",
                 "Score",
                 "Confidence",
                 "Is Sniper",
@@ -176,6 +242,12 @@ def export_reports(
                     p.total_sell_amount,
                     p.current_holding,
                     p.exit_ratio,
+                    p.wallet_age_days if p.wallet_age_days is not None else "",
+                    "YES" if p.is_fresh_wallet else "NO",
+                    p.funder_address or "",
+                    p.funder_type,
+                    p.funding_amount_sol if p.funding_amount_sol is not None else "",
+                    p.cluster_id or "",
                     p.score,
                     p.confidence.value,
                     "YES" if p.is_same_block_sniper else "NO",
@@ -373,6 +445,32 @@ def run_mock_simulation(output_dir: Path, export_csv_flag: bool, export_json_fla
             profiles.append(prof)
 
     profiles = tag_same_block_snipers(profiles)
+
+    # Mock funding & Sybil clustering
+    if len(profiles) >= 3:
+        profiles[0].funder_type = "CEX"
+        profiles[0].funder_address = "5tzFkiKscMRHK5ZXkrZXZ1RChPTyVC5yFsNuPaSkWCjd"
+        profiles[0].wallet_age_days = 0.08
+        profiles[0].is_fresh_wallet = True
+        profiles[0].funding_amount_sol = 5.0
+        profiles[0].funding_signature = "sig_mock_fund_0"
+
+        profiles[1].funder_type = "EOA"
+        profiles[1].funder_address = "SybilBoss11111111111111111111111111111111111"
+        profiles[1].wallet_age_days = 0.04
+        profiles[1].is_fresh_wallet = True
+        profiles[1].funding_amount_sol = 1.5
+        profiles[1].funding_signature = "sig_mock_fund_1"
+
+        profiles[2].funder_type = "EOA"
+        profiles[2].funder_address = "SybilBoss11111111111111111111111111111111111"
+        profiles[2].wallet_age_days = 0.05
+        profiles[2].is_fresh_wallet = True
+        profiles[2].funding_amount_sol = 2.0
+        profiles[2].funding_signature = "sig_mock_fund_2"
+
+        profiles = detect_funder_clusters(profiles)
+
     ranked_buyers = score_and_rank_buyers(profiles, launch_confidence=token.launch_confidence)
 
     print_executive_report(
@@ -478,8 +576,26 @@ def run_pipeline(
     buyer_profiles = tag_same_block_snipers(buyer_profiles)
     logger.info(f"Identified {len(buyer_profiles)} verified early buyers.")
 
-    # 10. Scoring and ranking
-    logger.info("Step 10: Calculating multi-pillar scores and ranking early buyers...")
+    # 10. Trace initial SOL funding & detect Sybil clusters
+    logger.info(f"Step 10: Tracing initial SOL funding and detecting Sybil clusters for {len(buyer_profiles)} buyers...")
+    for p in buyer_profiles:
+        funder_addr, funder_type, age_days, fund_amt, fund_sig = trace_wallet_funder(
+            wallet_address=p.wallet_address,
+            rpc_client=client,
+            db=db,
+            launch_time=token.launch_time,
+        )
+        p.funder_address = funder_addr
+        p.funder_type = funder_type
+        p.wallet_age_days = age_days
+        p.is_fresh_wallet = bool(age_days is not None and age_days < 1.0)
+        p.funding_amount_sol = fund_amt
+        p.funding_signature = fund_sig
+
+    buyer_profiles = detect_funder_clusters(buyer_profiles)
+
+    # 11. Scoring and ranking
+    logger.info("Step 11: Calculating multi-pillar scores and ranking early buyers...")
     ranked_buyers = score_and_rank_buyers(
         buyer_profiles,
         launch_confidence=token.launch_confidence,
@@ -489,7 +605,7 @@ def run_pipeline(
     for p, _ in ranked_buyers:
         db.save_wallet_profile(p)
 
-    # 11. Print executive report & export
+    # 12. Print executive report & export
     print_executive_report(
         token=token,
         candidates_count=len(candidates),

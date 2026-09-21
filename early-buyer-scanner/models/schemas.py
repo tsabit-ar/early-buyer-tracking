@@ -139,6 +139,13 @@ class WalletProfile(BaseModel):
     score: float = Field(default=0.0, ge=0.0, le=100.0, description="Calculated EBRS score (0-100)")
     confidence: ConfidenceEnum = Field(default=ConfidenceEnum.UNKNOWN, description="Aggregated confidence")
     is_same_block_sniper: bool = Field(default=False, description="Flag indicating if wallet bought in same slot as other early buyers")
+    wallet_age_days: Optional[float] = Field(default=None, description="Wallet age in days relative to token launch")
+    is_fresh_wallet: bool = Field(default=False, description="True if wallet age < 24 hours at token launch")
+    funder_address: Optional[str] = Field(default=None, description="Initial SOL funding source address")
+    funder_type: str = Field(default="UNKNOWN", description="Funder category: CEX, EOA, INTERNAL, MATURE_WALLET, UNKNOWN")
+    funding_amount_sol: Optional[float] = Field(default=None, description="Initial SOL funding amount received")
+    funding_signature: Optional[str] = Field(default=None, description="Signature of initial funding transaction")
+    cluster_id: Optional[str] = Field(default=None, description="Sybil cluster ID if sharing common funder")
     evidence_signatures: List[str] = Field(default_factory=list, description="Transaction signatures supporting this profile")
 
     @field_validator("exit_ratio")
