@@ -133,6 +133,7 @@ class Database:
                     wallet_address TEXT NOT NULL,
                     token_address TEXT NOT NULL,
                     first_buy_time INTEGER,
+                    first_buy_slot INTEGER,
                     first_buy_signature TEXT,
                     first_buy_amount REAL DEFAULT 0.0,
                     time_after_launch INTEGER,
@@ -146,11 +147,19 @@ class Database:
                     holder_percentage REAL,
                     score REAL DEFAULT 0.0,
                     confidence TEXT,
+                    is_same_block_sniper INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (wallet_address, token_address)
                 );
                 """
             )
+
+            # Migration for existing tables
+            for col, col_type in [("first_buy_slot", "INTEGER"), ("is_same_block_sniper", "INTEGER DEFAULT 0")]:
+                try:
+                    cursor.execute(f"ALTER TABLE wallet_profiles ADD COLUMN {col} {col_type};")
+                except sqlite3.OperationalError:
+                    pass
 
             # Table 4: wallet_events (PRD 11)
             cursor.execute(
@@ -408,14 +417,15 @@ class Database:
             cursor.execute(
                 """
                 INSERT INTO wallet_profiles (
-                    wallet_address, token_address, first_buy_time, first_buy_signature,
+                    wallet_address, token_address, first_buy_time, first_buy_slot, first_buy_signature,
                     first_buy_amount, time_after_launch, total_buy_amount, buy_count,
                     sell_count, total_sell_amount, current_holding, exit_ratio,
-                    holder_rank, holder_percentage, score, confidence
+                    holder_rank, holder_percentage, score, confidence, is_same_block_sniper
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(wallet_address, token_address) DO UPDATE SET
                     first_buy_time = excluded.first_buy_time,
+                    first_buy_slot = excluded.first_buy_slot,
                     first_buy_signature = excluded.first_buy_signature,
                     first_buy_amount = excluded.first_buy_amount,
                     time_after_launch = excluded.time_after_launch,
@@ -428,12 +438,14 @@ class Database:
                     holder_rank = excluded.holder_rank,
                     holder_percentage = excluded.holder_percentage,
                     score = excluded.score,
-                    confidence = excluded.confidence;
+                    confidence = excluded.confidence,
+                    is_same_block_sniper = excluded.is_same_block_sniper;
                 """,
                 (
                     profile.wallet_address,
                     profile.token_address,
                     profile.first_buy_time,
+                    profile.first_buy_slot,
                     profile.first_buy_signature,
                     profile.first_buy_amount,
                     profile.time_after_launch,
@@ -447,6 +459,7 @@ class Database:
                     profile.holder_percentage,
                     profile.score,
                     profile.confidence.value,
+                    1 if profile.is_same_block_sniper else 0,
                 ),
             )
 
@@ -462,11 +475,13 @@ class Database:
             rows = cursor.fetchall()
             profiles = []
             for r in rows:
+                col_keys = r.keys()
                 profiles.append(
                     WalletProfile(
                         wallet_address=r["wallet_address"],
                         token_address=r["token_address"],
                         first_buy_time=r["first_buy_time"],
+                        first_buy_slot=r["first_buy_slot"] if "first_buy_slot" in col_keys else None,
                         first_buy_signature=r["first_buy_signature"],
                         first_buy_amount=r["first_buy_amount"],
                         time_after_launch=r["time_after_launch"],
@@ -482,6 +497,7 @@ class Database:
                         confidence=ConfidenceEnum(r["confidence"])
                         if r["confidence"]
                         else ConfidenceEnum.UNKNOWN,
+                        is_same_block_sniper=bool(r["is_same_block_sniper"]) if "is_same_block_sniper" in col_keys else False,
                     )
                 )
             return profiles

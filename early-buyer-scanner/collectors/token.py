@@ -1,19 +1,27 @@
 """Token collector module for Early Buyer Scanner (EBRS).
 
-Validates Solana mint addresses, fetches token metadata via Solscan Pro API,
-and determines token launch timestamp and confidence.
+Validates Solana mint addresses, resolves token metadata via Metaplex Metadata PDA,
+Token-2022 extensions, or RPC fallback, and determines launch timestamp.
 """
 
+import base64
+import logging
 import re
+import struct
 from typing import Any, Dict, Optional, Tuple
+
+import httpx
 
 from api.solscan import SolscanClient
 from config import settings
 from models.schemas import ConfidenceEnum, TokenMetadata
 from storage.database import Database
 
+logger = logging.getLogger(__name__)
+
 # Standard Bitcoin/Solana Base58 alphabet (no 0, O, I, l)
 BASE58_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+METAPLEX_PROGRAM_ID = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
 
 
 def validate_solana_address(address: str) -> str:
@@ -40,12 +48,71 @@ def validate_solana_address(address: str) -> str:
     return trimmed
 
 
+def derive_metaplex_metadata_pda(mint_address: str) -> str:
+    """Derive the Metaplex Token Metadata PDA address for a given token mint.
+    
+    Seeds: [b"metadata", bytes(PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")), bytes(PublicKey(mint_address))]
+    Program ID: "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+    
+    Returns:
+        Base58 encoded PDA address string.
+    """
+    from solders.pubkey import Pubkey
+    metadata_program = Pubkey.from_string(METAPLEX_PROGRAM_ID)
+    mint_pubkey = Pubkey.from_string(mint_address)
+    seeds = [b"metadata", bytes(metadata_program), bytes(mint_pubkey)]
+    pda, _ = Pubkey.find_program_address(seeds, metadata_program)
+    return str(pda)
+
+
+def decode_metaplex_metadata(raw_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """Decode binary Metaplex Metadata account data to extract token name and symbol.
+    
+    Metaplex Metadata Layout (MetadataV1):
+    - Offset 0: Key (1 byte)
+    - Offset 1: Update authority (32 bytes)
+    - Offset 33: Mint (32 bytes)
+    - Offset 65: Name length (4 bytes LE uint32)
+    - Offset 69: Name string (padded with null bytes \x00)
+    - Offset 69 + name_len: Symbol length (4 bytes LE uint32)
+    - Offset 69 + name_len + 4: Symbol string (padded with null bytes \x00)
+    
+    Returns:
+        Tuple of (name, symbol) or (None, None).
+    """
+    if len(raw_bytes) < 69:
+        return None, None
+
+    try:
+        offset = 65
+        name_len = struct.unpack("<I", raw_bytes[offset:offset + 4])[0]
+        offset += 4
+        if offset + name_len > len(raw_bytes):
+            return None, None
+        name_str = raw_bytes[offset:offset + name_len].decode("utf-8", errors="ignore").strip("\x00").strip()
+        offset += name_len
+
+        if offset + 4 > len(raw_bytes):
+            return (name_str or None), None
+
+        symbol_len = struct.unpack("<I", raw_bytes[offset:offset + 4])[0]
+        offset += 4
+        if offset + symbol_len > len(raw_bytes):
+            return (name_str or None), None
+        symbol_str = raw_bytes[offset:offset + symbol_len].decode("utf-8", errors="ignore").strip("\x00").strip()
+
+        return (name_str or None), (symbol_str or None)
+    except Exception as exc:
+        logger.debug(f"Failed decoding Metaplex metadata payload: {exc}")
+        return None, None
+
+
 def fetch_token_metadata(
     mint_address: str,
     client: Optional[Any] = None,
     db: Optional[Database] = None,
 ) -> TokenMetadata:
-    """Retrieve token metadata from RPC/Solscan and persist to SQLite tokens table.
+    """Retrieve token metadata from RPC/Metaplex/Solscan and persist to SQLite tokens table.
     
     Args:
         mint_address: The Solana mint address.
@@ -65,13 +132,86 @@ def fetch_token_metadata(
         active_client = client
 
     token_address = valid_mint
-    name = None
-    symbol = None
+    name: Optional[str] = None
+    symbol: Optional[str] = None
     decimals_int = 9
-    creator = None
+    creator: Optional[str] = None
 
-    # If client has get_token_meta (Solscan)
-    if hasattr(active_client, "get_token_meta"):
+    # Check existing DB record
+    existing = active_db.get_token(valid_mint)
+    if existing and existing.name and existing.name != "UNKNOWN" and existing.symbol:
+        name = existing.name
+        symbol = existing.symbol
+        decimals_int = existing.decimals
+        creator = existing.creator
+
+    # 1. Metaplex Metadata PDA on-chain resolution (Standard SPL Tokens)
+    if not name or not symbol:
+        try:
+            pda_address = derive_metaplex_metadata_pda(valid_mint)
+            if hasattr(active_client, "get_account_info"):
+                pda_info = active_client.get_account_info(pda_address, encoding="base64")
+                if isinstance(pda_info, dict) and "data" in pda_info:
+                    raw_data_field = pda_info["data"]
+                    raw_b64 = raw_data_field[0] if isinstance(raw_data_field, list) else raw_data_field
+                    if isinstance(raw_b64, str):
+                        raw_bytes = base64.b64decode(raw_b64)
+                        meta_name, meta_symbol = decode_metaplex_metadata(raw_bytes)
+                        if meta_name:
+                            name = meta_name
+                        if meta_symbol:
+                            symbol = meta_symbol
+        except Exception as exc:
+            logger.debug(f"Metaplex PDA query encountered error: {exc}")
+
+    # 2. Token-2022 Extensions / Mint Account resolution (Modern Solana Tokens, e.g. ACAT)
+    if hasattr(active_client, "get_account_info"):
+        try:
+            acc_info = active_client.get_account_info(valid_mint, encoding="jsonParsed")
+            if isinstance(acc_info, dict) and "data" in acc_info:
+                d = acc_info["data"]
+                if isinstance(d, dict) and "parsed" in d:
+                    info = d["parsed"].get("info", {})
+                    if not creator:
+                        creator = info.get("mintAuthority")
+                    if "decimals" in info:
+                        try:
+                            decimals_int = int(info["decimals"])
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Parse embedded Token-2022 tokenMetadata extension
+                    extensions = info.get("extensions", [])
+                    for ext in extensions:
+                        if isinstance(ext, dict) and ext.get("extension") == "tokenMetadata":
+                            state = ext.get("state", {})
+                            if not name and state.get("name"):
+                                name = str(state["name"]).strip()
+                            if not symbol and state.get("symbol"):
+                                symbol = str(state["symbol"]).strip()
+        except Exception as exc:
+            logger.debug(f"Token-2022 extensions query encountered error: {exc}")
+
+    # 3. DexScreener Public API fallback
+    if not name or not symbol:
+        try:
+            dex_resp = httpx.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{valid_mint}",
+                timeout=5.0
+            )
+            if dex_resp.status_code == 200:
+                pairs = dex_resp.json().get("pairs", [])
+                if pairs and isinstance(pairs, list):
+                    base = pairs[0].get("baseToken", {})
+                    if not name and base.get("name"):
+                        name = str(base["name"]).strip()
+                    if not symbol and base.get("symbol"):
+                        symbol = str(base["symbol"]).strip()
+        except Exception as exc:
+            logger.debug(f"DexScreener API fallback error: {exc}")
+
+    # 4. Solscan Pro fallback (if available)
+    if (not name or not symbol) and hasattr(active_client, "get_token_meta"):
         try:
             raw_response = active_client.get_token_meta(valid_mint)
             data: Dict[str, Any] = {}
@@ -80,21 +220,21 @@ def fetch_token_metadata(
                     data = raw_response["data"]
                 else:
                     data = raw_response
-
-            token_address = data.get("address") or data.get("token_address") or valid_mint
-            name = data.get("name")
-            symbol = data.get("symbol")
-            decimals = data.get("decimals")
-            if decimals is not None:
+            if not name:
+                name = data.get("name")
+            if not symbol:
+                symbol = data.get("symbol")
+            if not creator:
+                creator = data.get("creator") or data.get("owner") or data.get("authority")
+            if "decimals" in data and data["decimals"] is not None:
                 try:
-                    decimals_int = int(decimals)
+                    decimals_int = int(data["decimals"])
                 except (ValueError, TypeError):
-                    decimals_int = 9
-            creator = data.get("creator") or data.get("owner") or data.get("authority")
+                    pass
         except Exception:
             pass
 
-    # If client has native Solana RPC methods (get_token_supply, get_account_info)
+    # 5. Token supply decimals check
     if hasattr(active_client, "get_token_supply"):
         try:
             supply_data = active_client.get_token_supply(valid_mint)
@@ -103,23 +243,17 @@ def fetch_token_metadata(
         except Exception:
             pass
 
-    if hasattr(active_client, "get_account_info") and not creator:
-        try:
-            acc_info = active_client.get_account_info(valid_mint)
-            if isinstance(acc_info, dict) and "data" in acc_info:
-                d = acc_info["data"]
-                if isinstance(d, dict) and "parsed" in d:
-                    creator = d["parsed"].get("info", {}).get("mintAuthority")
-        except Exception:
-            pass
+    # Fallback to defaults
+    if not name and symbol:
+        name = symbol
+    elif not symbol and name:
+        symbol = name
 
-    # Check if we already have launch_time and launch_confidence stored
-    existing = active_db.get_token(valid_mint)
     launch_time = existing.launch_time if existing else None
     launch_confidence = existing.launch_confidence if existing else ConfidenceEnum.LOW
 
     metadata = TokenMetadata(
-        token_address=token_address,
+        token_address=valid_mint,
         name=name,
         symbol=symbol,
         decimals=decimals_int,

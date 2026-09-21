@@ -206,9 +206,9 @@ class SolanaRpcClient:
             return result["value"]
         return result or {}
 
-    def get_account_info(self, account_address: str) -> Optional[Dict[str, Any]]:
-        """Get account info with jsonParsed encoding."""
-        config = {"encoding": "jsonParsed"}
+    def get_account_info(self, account_address: str, encoding: str = "jsonParsed") -> Optional[Dict[str, Any]]:
+        """Get account info with specified encoding (jsonParsed, base64, etc.)."""
+        config = {"encoding": encoding}
         result = self._call_rpc("getAccountInfo", [account_address, config])
         if isinstance(result, dict) and "value" in result:
             return result["value"]
@@ -263,6 +263,7 @@ class SolanaRpcClient:
         primary_signer = signers[0] if signers else ""
 
         block_time = tx_data.get("blockTime") or 0
+        slot = tx_data.get("slot")
 
         # Calculate SOL balance changes
         pre_balances = meta.get("preBalances", [])
@@ -334,6 +335,7 @@ class SolanaRpcClient:
             "data": {
                 "tx_hash": signature,
                 "block_time": block_time,
+                "slot": slot,
                 "status": 1 if meta.get("err") is None else 0,
                 "fee": meta.get("fee", 5000),
                 "signer": [primary_signer],

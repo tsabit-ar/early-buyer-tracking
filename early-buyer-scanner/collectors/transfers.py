@@ -112,7 +112,7 @@ def collect_historical_transfers(
         # Fetch signatures for the mint address
         raw_sigs = active_client.get_signatures_for_address(
             valid_mint,
-            limit=min(1000, max(max_transfers * 2, 50)),
+            limit=min(1000, max(max_transfers * 10, 200)),
         )
         if not raw_sigs:
             return []

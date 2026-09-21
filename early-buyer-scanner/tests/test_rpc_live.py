@@ -102,3 +102,68 @@ def test_rpc_live_or_cached_acat(memory_db):
         assert result.token_change > 0
     except (SolanaRPCError, Exception) as exc:
         pytest.skip(f"Public RPC rate limit or network issue: {exc}")
+
+
+def test_metaplex_pda_and_decoding():
+    """Verify Metaplex PDA derivation and binary unpacking."""
+    import struct
+    from collectors.token import decode_metaplex_metadata, derive_metaplex_metadata_pda
+
+    # 1. PDA derivation for BONK
+    bonk_pda = derive_metaplex_metadata_pda("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263")
+    assert bonk_pda == "FDZZbyY9XGpL3CNKUZxLk3wFTTQYL3TkDiDzqxrizcPN"
+
+    # 2. Decoding synthetic Metaplex binary payload
+    prefix = b"\x04" + (b"U" * 32) + (b"M" * 32)
+    name_bytes = b"Magic Token\x00\x00\x00"
+    symbol_bytes = b"MAGIC\x00"
+    raw_payload = prefix + struct.pack("<I", len(name_bytes)) + name_bytes + struct.pack("<I", len(symbol_bytes)) + symbol_bytes
+
+    name, symbol = decode_metaplex_metadata(raw_payload)
+    assert name == "Magic Token"
+    assert symbol == "MAGIC"
+
+
+def test_same_block_sniper_tagging(memory_db):
+    """Verify detection of wallets buying in the same slot and DB persistence."""
+    from analyzers.wallet_analyzer import tag_same_block_snipers
+    from models.schemas import WalletProfile
+
+    w1 = WalletProfile(
+        wallet_address="Wallet11111111111111111111111111111111111",
+        token_address=ACAT_MINT,
+        first_buy_time=1000,
+        first_buy_slot=448913860,
+        first_buy_amount=1000.0,
+    )
+    w2 = WalletProfile(
+        wallet_address="Wallet22222222222222222222222222222222222",
+        token_address=ACAT_MINT,
+        first_buy_time=1000,
+        first_buy_slot=448913860,  # Same slot!
+        first_buy_amount=2000.0,
+    )
+    w3 = WalletProfile(
+        wallet_address="Wallet33333333333333333333333333333333333",
+        token_address=ACAT_MINT,
+        first_buy_time=1010,
+        first_buy_slot=448913890,  # Different slot
+        first_buy_amount=500.0,
+    )
+
+    tagged = tag_same_block_snipers([w1, w2, w3])
+    assert tagged[0].is_same_block_sniper is True
+    assert tagged[1].is_same_block_sniper is True
+    assert tagged[2].is_same_block_sniper is False
+
+    # Test DB persistence
+    for p in tagged:
+        memory_db.save_wallet_profile(p)
+
+    db_profiles = memory_db.get_wallet_profiles(ACAT_MINT)
+    assert len(db_profiles) == 3
+    sniper_map = {p.wallet_address: p.is_same_block_sniper for p in db_profiles}
+    assert sniper_map["Wallet11111111111111111111111111111111111"] is True
+    assert sniper_map["Wallet22222222222222222222222222222222222"] is True
+    assert sniper_map["Wallet33333333333333333333333333333333333"] is False
+

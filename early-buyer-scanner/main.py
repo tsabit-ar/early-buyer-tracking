@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from analyzers.candidate_generator import extract_candidate_wallets, filter_candidate_events
 from analyzers.sell_analyzer import enrich_profile_with_sells
 from analyzers.transaction_classifier import classify_transaction
-from analyzers.wallet_analyzer import build_buyer_profile, format_time_delta
+from analyzers.wallet_analyzer import build_buyer_profile, format_time_delta, tag_same_block_snipers
 from api.solana_rpc import SolanaRpcClient
 from api.solscan import SolscanClient
 from collectors.holders import get_token_holders_data
@@ -74,16 +74,20 @@ def print_executive_report(
         else "N/A (Confidence LOW)"
     )
 
+    token_name = token.name or "UNKNOWN"
+    token_sym = token.symbol or token.token_address
+    token_display = f"{token_name} ({token_sym})"
+
     print("\n" + "=" * 49)
     print("EARLY BUYER SCANNER")
     print("=" * 49)
-    print(f"\nToken:\n{token.symbol or 'UNKNOWN'} ({token.name or token.token_address})")
+    print(f"\nToken:\n{token_display}")
     print(f"\nLaunch:\n{launch_str}")
     print(f"\nCandidates:\n{candidates_count}")
     print(f"\nLikely Buyers:\n{len(ranked_buyers)}")
-    print("\n" + "-" * 57)
-    print(f"{'RANK':<5} {'WALLET':<12} {'FIRST BUY':<11} {'SIZE':<12} {'HOLD':<8} {'SCORE':<5}")
-    print("-" * 57)
+    print("\n" + "-" * 67)
+    print(f"{'RANK':<5} {'WALLET':<12} {'FIRST BUY':<11} {'SIZE':<12} {'HOLD':<8} {'SCORE':<6} {'TAG':<8}")
+    print("-" * 67)
 
     for rank, (p, _) in enumerate(ranked_buyers[:top_n], start=1):
         wallet_short = truncate_address(p.wallet_address, 4, 3)
@@ -93,11 +97,12 @@ def print_executive_report(
         # Hold percentage: 100% * (1 - exit_ratio) or from holder_percentage
         retention_pct = max(0, int(round((1.0 - p.exit_ratio) * 100)))
         hold_str = f"{retention_pct}%"
+        tag_str = "[SNIPER]" if p.is_same_block_sniper else "-"
 
         print(
-            f"{rank:<5} {wallet_short:<12} {time_rel:<11} {size_str:<12} {hold_str:<8} {int(p.score):<5}"
+            f"{rank:<5} {wallet_short:<12} {time_rel:<11} {size_str:<12} {hold_str:<8} {int(p.score):<6} {tag_str:<8}"
         )
-    print("-" * 57)
+    print("-" * 67)
 
     # Detailed view of #1 Buyer if available
     if ranked_buyers:
@@ -108,6 +113,8 @@ def print_executive_report(
         print(top_buyer.wallet_address)
         print(f"\nClassification: BUY")
         print(f"Confidence: {top_buyer.confidence.value}")
+        if top_buyer.is_same_block_sniper:
+            print(f"Sniper Status: [SNIPER] (Same-Block Entry, Slot: {top_buyer.first_buy_slot or 'N/A'})")
         print(f"\nFirst Buy:\n{format_time_delta(top_buyer.time_after_launch)}")
         print(f"\nFirst Buy Size:\n{top_buyer.first_buy_amount:,.2f} tokens")
         print(f"\nBuy Count:\n{top_buyer.buy_count}")
@@ -115,6 +122,8 @@ def print_executive_report(
         print(f"\nEstimated Exit:\n{exit_pct}%")
         print("\nEvidence:")
         print(f"Transaction Signature: {top_buyer.first_buy_signature or 'N/A'}")
+        if top_buyer.first_buy_slot is not None:
+            print(f"Block Slot: {top_buyer.first_buy_slot}")
         print(f"Score Breakdown: Early={breakdown.early_entry_score:.0f}, Size={breakdown.buy_size_score:.0f}, Acc={breakdown.accumulation_score:.0f}, Hold={breakdown.holding_score:.0f}")
         print("=" * 49 + "\n")
 
@@ -139,6 +148,7 @@ def export_reports(
                 "Rank",
                 "Wallet Address",
                 "First Buy Timestamp",
+                "First Buy Slot",
                 "Time After Launch",
                 "First Buy Amount",
                 "Total Buy Amount",
@@ -149,6 +159,7 @@ def export_reports(
                 "Exit Ratio",
                 "Score",
                 "Confidence",
+                "Is Sniper",
                 "First Buy Signature",
             ])
             for rank, (p, _) in enumerate(ranked_buyers, start=1):
@@ -156,6 +167,7 @@ def export_reports(
                     rank,
                     p.wallet_address,
                     p.first_buy_time or "",
+                    p.first_buy_slot or "",
                     format_time_delta(p.time_after_launch),
                     p.first_buy_amount,
                     p.total_buy_amount,
@@ -166,6 +178,7 @@ def export_reports(
                     p.exit_ratio,
                     p.score,
                     p.confidence.value,
+                    "YES" if p.is_same_block_sniper else "NO",
                     p.first_buy_signature or "",
                 ])
         logger.info(f"CSV report exported to: {csv_path.resolve()}")
@@ -213,12 +226,13 @@ def run_mock_simulation(output_dir: Path, export_csv_flag: bool, export_json_fla
 
     # Pre-crafted Transaction Classifications
     tx_classifications = [
-        # Wallet 1: Bought +2m14s (134s), 4 buys total, sold 29%
+        # Wallet 1: Bought +2m14s (134s), 4 buys total, sold 29%, slot 300000001
         TransactionClassification(
             signature="sig_w1_buy1",
             wallet=wallets[0],
             token_address=token_mint,
             block_time=launch_timestamp + 134,
+            slot=300000001,
             classification=ClassificationEnum.BUY,
             confidence=ConfidenceEnum.HIGH,
             sol_change=-1.5,
@@ -230,6 +244,7 @@ def run_mock_simulation(output_dir: Path, export_csv_flag: bool, export_json_fla
             wallet=wallets[0],
             token_address=token_mint,
             block_time=launch_timestamp + 200,
+            slot=300000010,
             classification=ClassificationEnum.BUY,
             confidence=ConfidenceEnum.HIGH,
             sol_change=-1.0,
@@ -241,6 +256,7 @@ def run_mock_simulation(output_dir: Path, export_csv_flag: bool, export_json_fla
             wallet=wallets[0],
             token_address=token_mint,
             block_time=launch_timestamp + 250,
+            slot=300000020,
             classification=ClassificationEnum.BUY,
             confidence=ConfidenceEnum.HIGH,
             sol_change=-0.5,
@@ -252,18 +268,20 @@ def run_mock_simulation(output_dir: Path, export_csv_flag: bool, export_json_fla
             wallet=wallets[0],
             token_address=token_mint,
             block_time=launch_timestamp + 600,
+            slot=300000100,
             classification=ClassificationEnum.SELL,
             confidence=ConfidenceEnum.HIGH,
             sol_change=2.0,
             token_change=-707600.0,  # ~29% sold
             programs=[RAYDIUM_AMM_V4_ID],
         ),
-        # Wallet 2: Bought +3m02s (182s), 2 buys, sold 16%
+        # Wallet 2: Bought +3m02s (182s), 2 buys, sold 16%, SAME SLOT 300000001 (Sniper cluster!)
         TransactionClassification(
             signature="sig_w2_buy1",
             wallet=wallets[1],
             token_address=token_mint,
             block_time=launch_timestamp + 182,
+            slot=300000001,
             classification=ClassificationEnum.BUY,
             confidence=ConfidenceEnum.HIGH,
             sol_change=-0.85,
@@ -354,6 +372,7 @@ def run_mock_simulation(output_dir: Path, export_csv_flag: bool, export_json_fla
             enrich_profile_with_sells(prof, w_txs)
             profiles.append(prof)
 
+    profiles = tag_same_block_snipers(profiles)
     ranked_buyers = score_and_rank_buyers(profiles, launch_confidence=token.launch_confidence)
 
     print_executive_report(
@@ -456,6 +475,7 @@ def run_pipeline(
             enrich_profile_with_sells(profile, wallet_txs)
             buyer_profiles.append(profile)
 
+    buyer_profiles = tag_same_block_snipers(buyer_profiles)
     logger.info(f"Identified {len(buyer_profiles)} verified early buyers.")
 
     # 10. Scoring and ranking

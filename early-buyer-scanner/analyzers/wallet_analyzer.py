@@ -78,6 +78,7 @@ def build_buyer_profile(
 
     first_buy = buys[0]
     first_buy_time = first_buy.block_time
+    first_buy_slot = first_buy.slot
     first_buy_sig = first_buy.signature
     first_buy_amount = max(0.0, first_buy.token_change)
 
@@ -108,6 +109,7 @@ def build_buyer_profile(
         wallet_address=clean_wallet,
         token_address=clean_token,
         first_buy_time=first_buy_time,
+        first_buy_slot=first_buy_slot,
         first_buy_signature=first_buy_sig,
         first_buy_amount=first_buy_amount,
         time_after_launch=time_after_launch,
@@ -121,5 +123,33 @@ def build_buyer_profile(
         holder_percentage=holder_percentage,
         score=0.0,
         confidence=confidence,
+        is_same_block_sniper=False,
         evidence_signatures=evidence_signatures,
     )
+
+
+def tag_same_block_snipers(profiles: List[WalletProfile]) -> List[WalletProfile]:
+    """Identify and tag early buyers entering on the exact same Solana slot/block (Sniper bot clusters).
+    
+    If 2 or more wallets share the exact same first_buy_slot, their is_same_block_sniper
+    flag is set to True.
+    
+    Args:
+        profiles: List of constructed WalletProfile objects.
+        
+    Returns:
+        The mutated/updated list of WalletProfile objects.
+    """
+    slot_counts: Dict[int, int] = {}
+    for p in profiles:
+        if p.first_buy_slot is not None:
+            slot_counts[p.first_buy_slot] = slot_counts.get(p.first_buy_slot, 0) + 1
+
+    for p in profiles:
+        if p.first_buy_slot is not None and slot_counts[p.first_buy_slot] >= 2:
+            p.is_same_block_sniper = True
+        else:
+            p.is_same_block_sniper = False
+
+    return profiles
+

@@ -78,6 +78,7 @@ class TransactionDetail(BaseModel):
 
     signature: str = Field(..., description="Solana transaction signature")
     block_time: int = Field(..., description="Block unix timestamp")
+    slot: Optional[int] = Field(default=None, description="Solana slot/block number")
     signer: str = Field(..., description="Primary fee-payer / signer address")
     sol_balance_changes: List[BalanceChange] = Field(
         default_factory=list,
@@ -104,6 +105,7 @@ class TransactionClassification(BaseModel):
     wallet: str = Field(..., description="Candidate wallet address")
     token_address: str = Field(..., description="Token mint address")
     block_time: int = Field(default=0, description="Block timestamp")
+    slot: Optional[int] = Field(default=None, description="Solana slot/block number")
     classification: ClassificationEnum = Field(..., description="BUY, SELL, etc.")
     confidence: ConfidenceEnum = Field(..., description="HIGH, MEDIUM, etc.")
     reasons: List[str] = Field(default_factory=list, description="Audit trail of why this classification was assigned")
@@ -119,6 +121,7 @@ class WalletProfile(BaseModel):
     wallet_address: str = Field(..., description="Wallet public key")
     token_address: str = Field(..., description="Token mint address")
     first_buy_time: Optional[int] = Field(default=None, description="Unix timestamp of first verified buy")
+    first_buy_slot: Optional[int] = Field(default=None, description="Solana slot/block of first verified buy")
     first_buy_signature: Optional[str] = Field(default=None, description="Signature of first buy")
     first_buy_amount: float = Field(default=0.0, ge=0.0, description="Tokens received on first buy")
     time_after_launch: Optional[int] = Field(
@@ -135,6 +138,7 @@ class WalletProfile(BaseModel):
     holder_percentage: Optional[float] = Field(default=None, ge=0.0, le=100.0, description="Current percent of supply held")
     score: float = Field(default=0.0, ge=0.0, le=100.0, description="Calculated EBRS score (0-100)")
     confidence: ConfidenceEnum = Field(default=ConfidenceEnum.UNKNOWN, description="Aggregated confidence")
+    is_same_block_sniper: bool = Field(default=False, description="Flag indicating if wallet bought in same slot as other early buyers")
     evidence_signatures: List[str] = Field(default_factory=list, description="Transaction signatures supporting this profile")
 
     @field_validator("exit_ratio")

@@ -24,12 +24,20 @@ def parse_solscan_tx_detail(raw_data: Dict[str, Any], signature: str) -> Transac
         else:
             data = raw_data
 
-    # Extract block time
+    # Extract block time and slot
     bt = data.get("block_time") or data.get("time") or data.get("blockTime") or 0
     try:
         block_time = int(bt)
     except (ValueError, TypeError):
         block_time = 0
+
+    raw_slot = data.get("slot") or (raw_data.get("slot") if isinstance(raw_data, dict) else None)
+    slot: Optional[int] = None
+    if raw_slot is not None:
+        try:
+            slot = int(raw_slot)
+        except (ValueError, TypeError):
+            slot = None
 
     # Extract signer (string or list of strings)
     signer_val = data.get("signer")
@@ -161,6 +169,7 @@ def parse_solscan_tx_detail(raw_data: Dict[str, Any], signature: str) -> Transac
     return TransactionDetail(
         signature=signature.strip(),
         block_time=block_time,
+        slot=slot,
         signer=signer,
         sol_balance_changes=sol_changes,
         token_balance_changes=token_changes,
