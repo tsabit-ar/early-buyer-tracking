@@ -10,8 +10,12 @@ from pathlib import Path
 from typing import Dict, Set
 from dotenv import load_dotenv
 
-# Load .env if present
-load_dotenv()
+# Load .env if present (check module directory first, then cwd)
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+if ENV_FILE.exists():
+    load_dotenv(dotenv_path=ENV_FILE)
+else:
+    load_dotenv()
 
 # ==========================================
 # SOLANA ADDRESS CONSTANTS
