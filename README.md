@@ -35,11 +35,21 @@ early-buyer-scanner/
 - [x] **Phase 1: Foundation** (Config, Schemas, SQLite WAL & Caching, Solscan Client)
 - [x] **Phase 2: Data Collection & Candidate Generation** (Address validation, transfers, candidate filtering & extraction)
 - [x] **Phase 3: Transaction Detail Collector & Classification Engine** (Batch transaction retrieval, Evidence-first classifier)
-- [ ] **Phase 4: Wallet Analysis & Scoring Engine** (In progress)
-- [ ] **Phase 5: CLI & Reports Generation**
+- [x] **Phase 4: Wallet Analysis, Scoring Engine, CLI Runner & Reporting** (Holders, profiler, sell analyzer, scoring, ASCII report & CSV/JSON export)
 
 ## Running Tests
-To run all automated tests (30/30 passing):
+To run all automated tests (40/40 passing):
 ```bash
 python -c "import pytest, sys; sys.exit(pytest.main(['tests', '-v', '-o', 'cache_dir=.pytest_cache']))"
+```
+
+## Running the CLI Scanner
+### Live Mode:
+```bash
+python main.py --mint <SOLANA_MINT_ADDRESS> --max-transfers 200 --export-csv --export-json
+```
+
+### Offline Demonstration (Mock Mode):
+```bash
+python main.py --mock
 ```
