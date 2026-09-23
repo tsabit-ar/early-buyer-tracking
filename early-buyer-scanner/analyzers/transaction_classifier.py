@@ -106,6 +106,53 @@ def classify_transaction(
     if has_dex:
         reasons.append(f"DEX/AMM program detected: {', '.join(detected_dex)}")
 
+    # 4b. Pool and Counterparty Guards
+    from analyzers.candidate_generator import get_token_pool_addresses
+    pool_addresses = get_token_pool_addresses(clean_token)
+    if clean_wallet in pool_addresses:
+        reasons.append(f"Wallet is a known liquidity pool/bonding curve PDA ({clean_wallet})")
+        reasons.append("Pools are liquidity counterparties, not early buyers")
+        return TransactionClassification(
+            signature=tx.signature,
+            wallet=clean_wallet,
+            token_address=clean_token,
+            block_time=tx.block_time,
+            slot=tx.slot,
+            classification=ClassificationEnum.UNKNOWN,
+            confidence=ConfidenceEnum.LOW,
+            reasons=reasons,
+            sol_change=net_quote_change,
+            token_change=token_change,
+            programs=detected_dex if has_dex else tx.programs,
+        )
+
+    # In a DEX swap, if the signer sold target tokens, any other wallet receiving tokens is a counterparty pool
+    if has_dex and tx.signer and clean_wallet != tx.signer:
+        signer_token_change = sum(
+            tb.change for tb in tx.token_balance_changes
+            if tb.address.strip() == tx.signer.strip() and (tb.mint is None or tb.mint.strip() == clean_token)
+        )
+        signer_sol_change = sum(
+            sb.change for sb in tx.sol_balance_changes
+            if sb.address.strip() == tx.signer.strip()
+        )
+        if signer_token_change < 0 and signer_sol_change > 0:
+            reasons.append(f"Transaction is a SELL by signer {tx.signer}")
+            reasons.append(f"Evaluated wallet {clean_wallet} is counterparty/pool absorbing tokens")
+            return TransactionClassification(
+                signature=tx.signature,
+                wallet=clean_wallet,
+                token_address=clean_token,
+                block_time=tx.block_time,
+                slot=tx.slot,
+                classification=ClassificationEnum.UNKNOWN,
+                confidence=ConfidenceEnum.LOW,
+                reasons=reasons,
+                sol_change=net_quote_change,
+                token_change=token_change,
+                programs=detected_dex if has_dex else tx.programs,
+            )
+
     # 5. Core Classification Logic (Evidence First)
 
     # Case A: BUY (Token Received + Significant Quote Asset Spent)

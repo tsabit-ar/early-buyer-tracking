@@ -163,35 +163,68 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
 
         # Step 4: Filter & candidate generation
         status.update(label="4/7 Menyaring entitas non-buy & mengekstrak kandidat pembeli...", state="running")
-        filtered_events = filter_candidate_events(transfers, creator_address=token.creator)
+        filtered_events = filter_candidate_events(
+            transfers,
+            creator_address=token.creator,
+            token_address=valid_mint,
+        )
         candidates = extract_candidate_wallets(filtered_events, token_address=valid_mint, db=db)
 
         # Step 5: Holder statistics & Tx details
-        status.update(label=f"5/7 Memeriksa detail transaksi on-chain untuk {len(filtered_events)} transaksi...", state="running")
+        candidate_set = set(candidates)
+        candidate_events = [
+            e for e in transfers
+            if e.to_address in candidate_set or e.from_address in candidate_set
+        ]
+        signatures_to_inspect = list({e.signature for e in candidate_events if e.signature})
+        status.update(label=f"5/7 Memeriksa detail transaksi on-chain untuk {len(signatures_to_inspect)} transaksi...", state="running")
         holders_map = get_token_holders_data(valid_mint, client=client, db=db)
-        signatures_to_inspect = list({e.signature for e in filtered_events if e.signature})
         tx_details = get_transaction_details_batch(signatures_to_inspect, client=client, db=db)
         tx_detail_map = {tx.signature: tx for tx in tx_details}
 
         # Step 6: Classification & Profiling
         status.update(label="6/7 Mengklasifikasikan mutasi saldo & profiling early buyers...", state="running")
         all_classifications: List[TransactionClassification] = []
-        for event in filtered_events:
-            tx_detail = tx_detail_map.get(event.signature)
-            if not tx_detail:
-                continue
-            classified = classify_transaction(
-                tx=tx_detail,
-                wallet_address=event.to_address,
-                token_address=valid_mint,
-            )
-            all_classifications.append(classified)
-            db.save_transaction(classified, raw_data=tx_detail.raw_data)
+        for wallet in candidates:
+            wallet_events = [e for e in candidate_events if e.to_address == wallet or e.from_address == wallet]
+            seen_sigs = set()
+            for event in wallet_events:
+                if event.signature in seen_sigs:
+                    continue
+                seen_sigs.add(event.signature)
+                tx_detail = tx_detail_map.get(event.signature)
+                if not tx_detail:
+                    continue
+                classified = classify_transaction(
+                    tx=tx_detail,
+                    wallet_address=wallet,
+                    token_address=valid_mint,
+                )
+                all_classifications.append(classified)
+                db.save_transaction(classified, raw_data=tx_detail.raw_data)
 
         buyer_profiles: List[WalletProfile] = []
         for wallet in candidates:
             wallet_txs = [tx for tx in all_classifications if tx.wallet == wallet]
             holder_info = holders_map.get(wallet)
+            if not holder_info and hasattr(client, "_call_rpc"):
+                try:
+                    resp = client._call_rpc("getTokenAccountsByOwner", [
+                        wallet,
+                        {"mint": valid_mint},
+                        {"encoding": "jsonParsed"},
+                    ])
+                    accounts = resp.get("value", []) if resp else []
+                    live_bal = 0.0
+                    for acc in accounts:
+                        info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        ui_amount = info.get("tokenAmount", {}).get("uiAmount")
+                        if ui_amount is not None:
+                            live_bal += float(ui_amount)
+                    holder_info = {"amount": live_bal, "rank": None, "percentage": 0.0}
+                except Exception:
+                    holder_info = {"amount": 0.0, "rank": None, "percentage": 0.0}
+
             profile = build_buyer_profile(
                 wallet_address=wallet,
                 token_address=valid_mint,
