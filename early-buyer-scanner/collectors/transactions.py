@@ -124,16 +124,85 @@ def parse_solscan_tx_detail(raw_data: Dict[str, Any], signature: str) -> Transac
             except (ValueError, TypeError):
                 decs_int = 9
 
-            pre = float(item.get("pre_balance") or item.get("preBalance") or 0.0)
-            post = float(item.get("post_balance") or item.get("postBalance") or 0.0)
-            chg = float(item.get("change") if item.get("change") is not None else (post - pre))
+            divisor = 10**decs_int if decs_int > 0 else 1
 
-            # If token change is in raw base units (> 10^decimals), convert to UI units
-            divisor = 10**decs_int
-            if decs_int > 0 and (abs(chg) >= divisor * 10 or abs(pre) >= divisor * 10 or abs(post) >= divisor * 10):
-                pre = pre / divisor
-                post = post / divisor
-                chg = chg / divisor
+            # Priority A: Check if source explicitly indicates it is already a UI amount
+            is_explicit_ui = (
+                item.get("is_ui_amount") is True
+                or item.get("ui_amount") is not None
+                or item.get("uiAmount") is not None
+                or item.get("uiAmountString") is not None
+            )
+
+            if is_explicit_ui:
+                # Value is already in UI token units, do NOT divide by 10^decimals
+                pre = float(item.get("pre_balance") or item.get("preBalance") or 0.0)
+                post = float(item.get("post_balance") or item.get("postBalance") or 0.0)
+                if item.get("ui_amount") is not None:
+                    chg = float(item["ui_amount"])
+                elif item.get("uiAmount") is not None:
+                    chg = float(item["uiAmount"])
+                elif item.get("uiAmountString") is not None:
+                    try:
+                        chg = float(item["uiAmountString"])
+                    except (ValueError, TypeError):
+                        chg = float(item.get("change") if item.get("change") is not None else (post - pre))
+                elif item.get("change") is not None:
+                    chg = float(item["change"])
+                else:
+                    chg = post - pre
+
+            # Priority B: Check if source gives a raw integer amount (e.g. from Solscan API or raw events)
+            elif item.get("raw_amount") is not None:
+                raw_amt = float(item["raw_amount"])
+                chg = raw_amt / divisor
+                pre = float(item.get("pre_balance") or item.get("preBalance") or 0.0)
+                if isinstance(item.get("pre_balance"), int) or (isinstance(item.get("pre_balance"), str) and item["pre_balance"].lstrip("-+").isdigit()):
+                    pre = pre / divisor
+                post = float(item.get("post_balance") or item.get("postBalance") or 0.0)
+                if isinstance(item.get("post_balance"), int) or (isinstance(item.get("post_balance"), str) and item["post_balance"].lstrip("-+").isdigit()):
+                    post = post / divisor
+
+            elif item.get("amount") is not None:
+                amt_val = item.get("amount")
+                # If int or integer string without dot, it is raw amount
+                if isinstance(amt_val, int) or (isinstance(amt_val, str) and str(amt_val).lstrip("-+").isdigit()):
+                    raw_amt = float(amt_val)
+                    chg = raw_amt / divisor
+                else:
+                    # Float or string with decimal point: already UI amount
+                    chg = float(amt_val)
+                pre = float(item.get("pre_balance") or item.get("preBalance") or 0.0)
+                if isinstance(item.get("pre_balance"), int) or (isinstance(item.get("pre_balance"), str) and str(item["pre_balance"]).lstrip("-+").isdigit()):
+                    pre = pre / divisor
+                post = float(item.get("post_balance") or item.get("postBalance") or 0.0)
+                if isinstance(item.get("post_balance"), int) or (isinstance(item.get("post_balance"), str) and str(item["post_balance"]).lstrip("-+").isdigit()):
+                    post = post / divisor
+
+            else:
+                # Priority C: Standard pre/post/change handling
+                # If pre_balance/post_balance/change are raw integers, divide; if already float with decimals, keep as UI amount
+                pre_raw = item.get("pre_balance") or item.get("preBalance") or 0.0
+                post_raw = item.get("post_balance") or item.get("postBalance") or 0.0
+                chg_raw = item.get("change")
+
+                pre_is_int = isinstance(pre_raw, int) or (isinstance(pre_raw, str) and pre_raw.lstrip("-+").isdigit())
+                post_is_int = isinstance(post_raw, int) or (isinstance(post_raw, str) and post_raw.lstrip("-+").isdigit())
+                chg_is_int = isinstance(chg_raw, int) or (isinstance(chg_raw, str) and str(chg_raw).lstrip("-+").isdigit())
+
+                # If all non-zero inputs are pure integers, they are base units -> divide
+                if (chg_is_int or chg_raw is None) and (pre_is_int or float(pre_raw) == 0.0) and (post_is_int or float(post_raw) == 0.0):
+                    pre = float(pre_raw) / divisor
+                    post = float(post_raw) / divisor
+                    if chg_raw is not None:
+                        chg = float(chg_raw) / divisor
+                    else:
+                        chg = post - pre
+                else:
+                    # Floating point represents UI amount directly
+                    pre = float(pre_raw)
+                    post = float(post_raw)
+                    chg = float(chg_raw) if chg_raw is not None else (post - pre)
 
             token_changes.append(
                 BalanceChange(

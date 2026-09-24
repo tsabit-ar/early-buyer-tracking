@@ -53,10 +53,20 @@ METEORA_POOLS_ID = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB"
 ORCA_WHIRLPOOL_ID = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
 JUPITER_V6_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
 
+# Pump.fun Ecosystem AMM & Fee Programs
+PUMP_SWAP_AMM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+PUMP_FEES_PROGRAM_ID = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
+
+# High-volume Solana Trading & Sniper Routers
+AXIOM_TRADE_ROUTER_ID = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"
+
 # Set of DEX / AMM Programs for fast lookup during classification
 KNOWN_DEX_PROGRAMS: Set[str] = {
     PUMP_FUN_PROGRAM_ID,
     PUMP_FUN_FEE_MIGRATION_ID,
+    PUMP_SWAP_AMM_ID,
+    PUMP_FEES_PROGRAM_ID,
+    AXIOM_TRADE_ROUTER_ID,
     RAYDIUM_AMM_V4_ID,
     RAYDIUM_CPMM_ID,
     RAYDIUM_CLMM_ID,
@@ -76,6 +86,14 @@ KNOWN_NON_BUY_ADDRESSES: Set[str] = {
     PUMP_FUN_FEE_MIGRATION_ID,
     "11111111111111111111111111111111",
     "deaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+}
+
+# Known Burn and Null addresses
+BURN_ADDRESSES: Set[str] = {
+    "11111111111111111111111111111111",
+    "deaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+    "1111111111111111111111111111111111111111111",
+    "00000000000000000000000000000000000000000000",
 }
 
 # ==========================================

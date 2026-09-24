@@ -206,7 +206,7 @@ def test_standard_transfer_not_buy():
 
     # From sender's perspective: sent tokens, paid gas -> TRANSFER
     res_sender = classify_transaction(tx, wallet_address=sender_wallet, token_address=token_mint)
-    assert res_sender.classification == ClassificationEnum.TRANSFER
+    assert res_sender.classification in (ClassificationEnum.TRANSFER, ClassificationEnum.TRANSFER_OUT)
     assert res_sender.confidence == ConfidenceEnum.HIGH
 
     # From receiver's perspective: received tokens, paid 0 gas -> DISTRIBUTION

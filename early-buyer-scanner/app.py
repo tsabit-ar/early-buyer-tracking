@@ -28,6 +28,7 @@ from analyzers.sell_analyzer import enrich_profile_with_sells
 from analyzers.transaction_classifier import classify_transaction
 from analyzers.wallet_analyzer import build_buyer_profile, format_time_delta, tag_same_block_snipers
 from api.solana_rpc import SolanaRpcClient
+from collectors.candidate_lifecycle import fetch_candidate_lifecycle_signatures
 from collectors.holders import get_token_holders_data
 from collectors.token import fetch_token_metadata, resolve_launch_time, validate_solana_address
 from collectors.transfers import collect_historical_transfers
@@ -170,13 +171,25 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
         )
         candidates = extract_candidate_wallets(filtered_events, token_address=valid_mint, db=db)
 
-        # Step 5: Holder statistics & Tx details
+        # Step 5: Holder statistics, Candidate ATA Lifecycle & Tx details
+        status.update(label=f"5/7 Melacak riwayat lifecycle lengkap via ATA untuk {len(candidates)} kandidat...", state="running")
         candidate_set = set(candidates)
         candidate_events = [
             e for e in transfers
             if e.to_address in candidate_set or e.from_address in candidate_set
         ]
-        signatures_to_inspect = list({e.signature for e in candidate_events if e.signature})
+        initial_transfer_sigs = {e.signature for e in candidate_events if e.signature}
+
+        lifecycle_map = fetch_candidate_lifecycle_signatures(
+            client=client,
+            candidate_wallets=candidates,
+            token_mint=valid_mint,
+            max_signatures_per_ata=500,
+        )
+
+        all_lifecycle_sigs = {sig for info in lifecycle_map.values() for sig in info.signatures}
+        signatures_to_inspect = list(initial_transfer_sigs | all_lifecycle_sigs)
+
         status.update(label=f"5/7 Memeriksa detail transaksi on-chain untuk {len(signatures_to_inspect)} transaksi...", state="running")
         holders_map = get_token_holders_data(valid_mint, client=client, db=db)
         tx_details = get_transaction_details_batch(signatures_to_inspect, client=client, db=db)
@@ -186,13 +199,13 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
         status.update(label="6/7 Mengklasifikasikan mutasi saldo & profiling early buyers...", state="running")
         all_classifications: List[TransactionClassification] = []
         for wallet in candidates:
-            wallet_events = [e for e in candidate_events if e.to_address == wallet or e.from_address == wallet]
-            seen_sigs = set()
-            for event in wallet_events:
-                if event.signature in seen_sigs:
-                    continue
-                seen_sigs.add(event.signature)
-                tx_detail = tx_detail_map.get(event.signature)
+            w_lifecycle_sigs = set(lifecycle_map[wallet].signatures) if wallet in lifecycle_map else set()
+            w_transfer_sigs = {e.signature for e in candidate_events if (e.to_address == wallet or e.from_address == wallet) and e.signature}
+            combined_wallet_sigs = list(w_lifecycle_sigs | w_transfer_sigs)
+            combined_wallet_sigs.sort(key=lambda s: (tx_detail_map[s].slot or 0, tx_detail_map[s].block_time or 0) if s in tx_detail_map else (0, 0))
+
+            for sig in combined_wallet_sigs:
+                tx_detail = tx_detail_map.get(sig)
                 if not tx_detail:
                     continue
                 classified = classify_transaction(
@@ -233,10 +246,48 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
                 holder_data=holder_info,
             )
             if profile:
+                info = lifecycle_map.get(wallet)
+                if info:
+                    profile.lifecycle_history_complete = info.lifecycle_history_complete
+                    profile.lifecycle_signature_count = info.lifecycle_signature_count
+                    profile.lifecycle_atas = info.lifecycle_atas
+
                 enrich_profile_with_sells(profile, wallet_txs)
+
+                # Candidate Discovery Metadata & Safety Rules
+                profile.candidate_discovery_complete = getattr(transfers, "candidate_discovery_complete", True)
+                profile.candidate_discovery_truncated = getattr(transfers, "candidate_discovery_truncated", False)
+                profile.genesis_reached = getattr(transfers, "genesis_reached", True)
+                profile.discovery_source = getattr(transfers, "discovery_source", "UNKNOWN")
+                profile.discovery_pages_fetched = getattr(transfers, "discovery_pages_fetched", 0)
+                profile.discovery_signatures_fetched = getattr(transfers, "discovery_signatures_fetched", 0)
+                profile.oldest_discovered_block_time = getattr(transfers, "oldest_discovered_block_time", None)
+                profile.oldest_discovered_slot = getattr(transfers, "oldest_discovered_slot", None)
+                profile.discovery_termination_reason = getattr(transfers, "discovery_termination_reason", None)
+                profile.early_window_hours = 24.0
+
+                if token.launch_time is not None and profile.first_buy_time is not None:
+                    profile.is_in_early_window = bool(
+                        profile.first_buy_time <= token.launch_time + int(24.0 * 3600)
+                    )
+                else:
+                    profile.is_in_early_window = profile.candidate_discovery_complete
+
+                if profile.candidate_discovery_complete:
+                    profile.candidate_discovery_status = "COMPLETE"
+                else:
+                    profile.candidate_discovery_status = "DISCOVERY_INCOMPLETE"
+                    # Safety rule: if candidate discovery is incomplete, do NOT assign HIGH confidence
+                    if profile.confidence == ConfidenceEnum.HIGH:
+                        profile.confidence = ConfidenceEnum.MEDIUM
+
                 buyer_profiles.append(profile)
 
         buyer_profiles = tag_same_block_snipers(buyer_profiles)
+        # Suppress sniper tags if discovery was incomplete
+        if not getattr(transfers, "candidate_discovery_complete", True):
+            for p in buyer_profiles:
+                p.is_same_block_sniper = False
 
         # Step 7: V2 Funding & Sybil Detection
         status.update(label=f"7/7 Melacak sumber dana SOL pertama & mendeteksi kluster Sybil...", state="running")
@@ -267,6 +318,7 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
         "token": token,
         "candidates_count": len(candidates),
         "ranked_buyers": ranked_buyers,
+        "transfers": transfers,
     }
 
 
@@ -297,6 +349,28 @@ def generate_csv_bytes(ranked_buyers: List[Tuple[WalletProfile, ScoreBreakdown]]
         "Confidence",
         "Is Sniper",
         "First Buy Signature",
+        "Lifecycle Complete",
+        "Lifecycle Truncated",
+        "Reconciliation Status",
+        "Reconciliation Difference",
+        "Transfer In Amount",
+        "Transfer Out Amount",
+        "Net Transfer Amount",
+        "Burn Amount",
+        "Unknown In Amount",
+        "Unknown Out Amount",
+        "Unknown Transaction Count",
+        "ATA Signatures Count",
+        "Lifecycle Pages Fetched",
+        "Last Cursor Signature",
+        "Truncation Reason",
+        "Candidate Discovery Complete",
+        "Candidate Discovery Truncated",
+        "Genesis Reached",
+        "Discovery Source",
+        "Oldest Discovered Time",
+        "Discovery Termination Reason",
+        "In Early Window",
     ])
     for rank, (p, _) in enumerate(ranked_buyers, start=1):
         writer.writerow([
@@ -322,6 +396,28 @@ def generate_csv_bytes(ranked_buyers: List[Tuple[WalletProfile, ScoreBreakdown]]
             p.confidence.value,
             "YES" if p.is_same_block_sniper else "NO",
             p.first_buy_signature or "",
+            "YES" if p.lifecycle_history_complete else "NO",
+            "YES" if p.lifecycle_truncated else "NO",
+            p.balance_reconciliation_status,
+            p.reconciliation_difference,
+            p.transfer_in_amount,
+            p.transfer_out_amount,
+            p.net_transfer_amount,
+            p.burn_amount,
+            p.unknown_in_amount,
+            p.unknown_outflow_amount,
+            p.unknown_tx_count,
+            p.lifecycle_signature_count,
+            p.lifecycle_pages_fetched,
+            p.last_cursor_signature or "",
+            p.truncation_reason or "",
+            "YES" if p.candidate_discovery_complete else "NO",
+            "YES" if p.candidate_discovery_truncated else "NO",
+            "YES" if p.genesis_reached else "NO",
+            p.discovery_source,
+            p.oldest_discovered_block_time or "",
+            p.discovery_termination_reason or "",
+            "YES" if p.is_in_early_window else "NO",
         ])
     return output.getvalue().encode("utf-8")
 
@@ -446,6 +542,19 @@ if "scan_results" in st.session_state:
             unsafe_allow_html=True,
         )
 
+    transfers = res.get("transfers")
+    if transfers is not None and not getattr(transfers, "candidate_discovery_complete", True):
+        st.warning(
+            f"⚠️ **PERINGATAN: Candidate discovery tidak lengkap (Incomplete Discovery).**\n\n"
+            f"• **Alasan:** `{getattr(transfers, 'discovery_termination_reason', 'MAX_PAGES_REACHED')}`\n"
+            f"• **Sumber:** `{getattr(transfers, 'discovery_source', 'NATIVE_RPC_BOUNDED')}`\n"
+            f"• **Halaman RPC:** `{getattr(transfers, 'discovery_pages_fetched', 0)}` halaman "
+            f"({getattr(transfers, 'discovery_signatures_fetched', 0)} signatures diperiksa)\n\n"
+            "**Catatan Kritis:** Riwayat genesis on-chain tidak terjangkau dalam batas pencarian. "
+            "Kandidat di bawah ini teridentifikasi dari riwayat transaksi terbaru dalam batas pencarian, "
+            "BUKAN pembeli awal peluncuran (genesis early buyers mungkin terlewat)."
+        )
+
     st.markdown("---")
 
     # ------------------------------------------
@@ -463,6 +572,12 @@ if "scan_results" in st.session_state:
 
         retention_pct = max(0, int(round((1.0 - p.exit_ratio) * 100)))
 
+        tag_display = "-"
+        if not p.candidate_discovery_complete:
+            tag_display = "[UNVERIFIED]"
+        elif p.is_same_block_sniper:
+            tag_display = "[SNIPER]"
+
         table_data.append({
             "Rank": rank,
             "Wallet": p.wallet_address,
@@ -474,7 +589,8 @@ if "scan_results" in st.session_state:
             "Funder": funder_display,
             "Cluster": p.cluster_id or "-",
             "Score": int(round(p.score)),
-            "Tag": "[SNIPER]" if p.is_same_block_sniper else "-",
+            "Tag": tag_display,
+            "Discovery": "COMPLETE" if p.candidate_discovery_complete else "INCOMPLETE",
             "Buy Tx": tx_explorer_link,
         })
 

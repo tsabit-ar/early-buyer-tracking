@@ -8,13 +8,19 @@ import base64
 import logging
 import re
 import struct
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
 from api.solscan import SolscanClient
 from config import settings
-from models.schemas import ConfidenceEnum, TokenMetadata
+from models.schemas import (
+    ConfidenceEnum,
+    LaunchResolutionType,
+    LaunchTimeResolution,
+    TokenMetadata,
+)
 from storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -266,34 +272,104 @@ def fetch_token_metadata(
     return metadata
 
 
+def fetch_dexscreener_pair_created_at(
+    mint_address: str, timeout: float = 5.0
+) -> Optional[Tuple[int, str, str]]:
+    """Fetch earliest pair creation timestamp from DexScreener for a mint.
+
+    Args:
+        mint_address: Solana token mint address.
+        timeout: HTTP request timeout in seconds.
+
+    Returns:
+        Tuple of (pair_created_at_seconds, dex_id, pair_address) or None.
+    """
+    try:
+        resp = httpx.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint_address}",
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            pairs = data.get("pairs") or []
+            if isinstance(pairs, list) and pairs:
+                valid_pairs = []
+                for p in pairs:
+                    pca = p.get("pairCreatedAt")
+                    if pca and isinstance(pca, (int, float)) and pca > 0:
+                        valid_pairs.append((
+                            int(pca // 1000),
+                            str(p.get("dexId", "unknown")),
+                            str(p.get("pairAddress", "")),
+                        ))
+                if valid_pairs:
+                    # Sort by created_at ascending to find the earliest pool
+                    valid_pairs.sort(key=lambda x: x[0])
+                    return valid_pairs[0]
+    except Exception as exc:
+        logger.debug(f"DexScreener pairCreatedAt query error for {mint_address}: {exc}")
+    return None
+
+
 def resolve_launch_time(
     mint_address: str,
     client: Optional[Any] = None,
     db: Optional[Database] = None,
-) -> Tuple[Optional[int], str]:
-    """Resolve token launch timestamp by querying the earliest historical transfer/signature.
+    max_pages: int = 5,
+    max_signatures: int = 5000,
+    max_elapsed_seconds: float = 10.0,
+    force_refresh: bool = False,
+) -> LaunchTimeResolution:
+    """Resolve token launch timestamp with bounded pagination and evidence-first classification.
     
+    Guarantees strict termination:
+    - Never loops unbounded on high-volume tokens.
+    - Limits RPC traversal by max_pages, max_signatures, and max_elapsed_seconds.
+    - Detects stagnant cursor to prevent infinite loops.
+    
+    Evidence hierarchy:
+    1. EXACT GENESIS (HIGH confidence): On-chain ledger history naturally terminated
+       (batch size < limit), reaching the InitializeMint creation transaction.
+    2. ESTIMATED LAUNCH (MEDIUM confidence): Bounded limit hit; resolved via DEX liquidity
+       pool creation timestamp (e.g. DexScreener pairCreatedAt).
+    3. BOUNDED OLDEST (LOW confidence): Bounded limit hit and DEX pool unavailable;
+       using oldest signature seen in bounded window.
+    4. UNKNOWN: No signatures or pool data available.
+
     Args:
-        mint_address: The Solana mint address.
+        mint_address: Solana mint address.
         client: Optional SolanaRpcClient or SolscanClient instance.
         db: Optional Database instance.
+        max_pages: Maximum RPC signature pages to fetch (default: 5).
+        max_signatures: Maximum total signatures to fetch (default: 5000).
+        max_elapsed_seconds: Maximum wall-clock seconds for RPC queries (default: 10.0).
+        force_refresh: If True, bypass SQLite cache and re-query.
         
     Returns:
-        Tuple of (launch_time, launch_confidence).
+        LaunchTimeResolution instance (can be unpacked as (launch_time, launch_confidence)).
     """
     valid_mint = validate_solana_address(mint_address)
     active_db = db or Database(settings.sqlite_db_path)
     
     # 1. Check existing DB record for valid launch_time (SQLite Idempotency)
-    existing = active_db.get_token(valid_mint)
-    if existing and existing.launch_time and existing.launch_time > 0:
-        conf_val = (
-            existing.launch_confidence.value
-            if hasattr(existing.launch_confidence, "value")
-            else str(existing.launch_confidence)
-        )
-        logger.info(f"Using cached launch time for {valid_mint}: {existing.launch_time} ({conf_val})")
-        return existing.launch_time, conf_val
+    if not force_refresh:
+        existing = active_db.get_token(valid_mint)
+        if existing and existing.launch_time and existing.launch_time > 0:
+            conf_enum = (
+                existing.launch_confidence
+                if isinstance(existing.launch_confidence, ConfidenceEnum)
+                else ConfidenceEnum(existing.launch_confidence)
+            )
+            conf_val = conf_enum.value
+            logger.info(f"Using cached launch time for {valid_mint}: {existing.launch_time} ({conf_val})")
+            return LaunchTimeResolution(
+                token_address=valid_mint,
+                launch_time=existing.launch_time,
+                confidence=conf_enum,
+                resolution_type=LaunchResolutionType.CACHED_DB.value,
+                evidence_details="Retrieved from SQLite database cache",
+                termination_reason="CACHE_HIT",
+            )
 
     if client is None:
         from api.solana_rpc import SolanaRpcClient
@@ -301,77 +377,213 @@ def resolve_launch_time(
     else:
         active_client = client
 
-    launch_time: Optional[int] = None
-    launch_confidence: str = ConfidenceEnum.LOW.value
+    start_time = time.time()
+    pages_fetched = 0
+    signatures_fetched = 0
+    termination_reason = ""
+    reached_natural_genesis = False
+    oldest_sig_info: Optional[Dict[str, Any]] = None
 
-    # If client has native Solana RPC get_signatures_for_address
+    # Branch 1: Native Solana RPC client with get_signatures_for_address
     if hasattr(active_client, "get_signatures_for_address"):
         try:
             before = None
-            oldest_sig_info = None
             while True:
-                batch = active_client.get_signatures_for_address(valid_mint, limit=1000, before=before)
-                if not batch:
+                # 1. Timeout check
+                elapsed = time.time() - start_time
+                if elapsed >= max_elapsed_seconds:
+                    termination_reason = "TIMEOUT_REACHED"
+                    logger.warning(
+                        f"resolve_launch_time for {valid_mint} hit timeout {max_elapsed_seconds}s "
+                        f"after {pages_fetched} pages ({signatures_fetched} sigs)."
+                    )
                     break
-                oldest_sig_info = batch[-1]
-                if len(batch) < 1000:
-                    break
-                before = oldest_sig_info.get("signature")
 
-            if oldest_sig_info and oldest_sig_info.get("blockTime") is not None:
-                launch_time = int(oldest_sig_info["blockTime"])
-                launch_confidence = ConfidenceEnum.HIGH.value
+                # 2. Max pages check
+                if pages_fetched >= max_pages:
+                    termination_reason = "MAX_PAGES_REACHED"
+                    logger.info(
+                        f"resolve_launch_time for {valid_mint} hit max pages {max_pages} "
+                        f"({signatures_fetched} sigs)."
+                    )
+                    break
+
+                # 3. Max signatures check
+                remaining_sigs = max_signatures - signatures_fetched
+                if remaining_sigs <= 0:
+                    termination_reason = "MAX_SIGNATURES_REACHED"
+                    break
+
+                page_limit = min(1000, remaining_sigs)
+                batch = active_client.get_signatures_for_address(valid_mint, limit=page_limit, before=before)
+                pages_fetched += 1
+
+                if not batch:
+                    if signatures_fetched > 0:
+                        reached_natural_genesis = True
+                        termination_reason = "NATURAL_TERMINATION_EMPTY_BATCH"
+                    else:
+                        termination_reason = "NO_SIGNATURES_FOUND"
+                    break
+
+                signatures_fetched += len(batch)
+                last_sig = batch[-1]
+                new_before = last_sig.get("signature")
+
+                # Stagnant cursor detection
+                if new_before == before:
+                    logger.warning(f"Stagnant cursor detected at signature '{before}' for {valid_mint}.")
+                    termination_reason = "STAGNANT_CURSOR"
+                    oldest_sig_info = last_sig
+                    break
+
+                oldest_sig_info = last_sig
+                before = new_before
+
+                # Natural termination check: batch returned fewer than requested limit
+                if len(batch) < page_limit:
+                    reached_natural_genesis = True
+                    termination_reason = "NATURAL_TERMINATION"
+                    logger.info(
+                        f"Reached natural genesis for {valid_mint}: batch size {len(batch)} < {page_limit}. "
+                        f"Genesis signature: {oldest_sig_info.get('signature')}"
+                    )
+                    break
+
         except Exception as exc:
             logger.warning(f"Error resolving launch time via Solana RPC: {exc}")
+            termination_reason = f"RPC_ERROR: {exc}"
 
-    # If client has get_token_transfers (Solscan fallback)
+    # Branch 2: Solscan fallback client (if client does not have get_signatures_for_address)
     elif hasattr(active_client, "get_token_transfers"):
-        resp = active_client.get_token_transfers(
-            token_address=valid_mint,
-            page=1,
-            page_size=1,
-            sort_by="block_time",
-            sort_order="asc",
-        )
-        items = []
-        if isinstance(resp, dict):
-            if "data" in resp:
-                data_val = resp["data"]
-                if isinstance(data_val, list):
-                    items = data_val
-                elif isinstance(data_val, dict) and "items" in data_val:
-                    items = data_val["items"]
-        elif isinstance(resp, list):
-            items = resp
-
-        if items and len(items) > 0:
-            first_tx = items[0]
-            bt = (
-                first_tx.get("block_time")
-                or first_tx.get("time")
-                or first_tx.get("blockTime")
+        try:
+            resp = active_client.get_token_transfers(
+                token_address=valid_mint,
+                page=1,
+                page_size=1,
+                sort_by="block_time",
+                sort_order="asc",
             )
-            if bt is not None:
-                try:
-                    launch_time = int(bt)
-                    launch_confidence = ConfidenceEnum.HIGH.value
-                except (ValueError, TypeError):
-                    launch_time = None
-                    launch_confidence = ConfidenceEnum.LOW.value
+            items = []
+            if isinstance(resp, dict):
+                if "data" in resp:
+                    data_val = resp["data"]
+                    if isinstance(data_val, list):
+                        items = data_val
+                    elif isinstance(data_val, dict) and "items" in data_val:
+                        items = data_val["items"]
+            elif isinstance(resp, list):
+                items = resp
+
+            if items and len(items) > 0:
+                first_tx = items[0]
+                bt = (
+                    first_tx.get("block_time")
+                    or first_tx.get("time")
+                    or first_tx.get("blockTime")
+                )
+                if bt is not None:
+                    try:
+                        bt_int = int(bt)
+                        reached_natural_genesis = True
+                        oldest_sig_info = {
+                            "blockTime": bt_int,
+                            "signature": first_tx.get("tx_hash") or first_tx.get("trans_id") or first_tx.get("signature"),
+                            "slot": first_tx.get("slot"),
+                        }
+                        termination_reason = "SOLSCAN_ASC_FIRST_TX"
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as exc:
+            logger.warning(f"Error resolving launch time via Solscan: {exc}")
+            termination_reason = f"SOLSCAN_ERROR: {exc}"
+
+    # Evaluate Resolution & Confidence
+    launch_time: Optional[int] = None
+    confidence: ConfidenceEnum = ConfidenceEnum.UNKNOWN
+    resolution_type: str = LaunchResolutionType.UNKNOWN.value
+    evidence_sig: Optional[str] = None
+    evidence_slot: Optional[int] = None
+    evidence_details: Optional[str] = None
+
+    if reached_natural_genesis and oldest_sig_info and oldest_sig_info.get("blockTime") is not None:
+        # EXACT GENESIS FOUND
+        launch_time = int(oldest_sig_info["blockTime"])
+        confidence = ConfidenceEnum.HIGH
+        resolution_type = LaunchResolutionType.EXACT_GENESIS.value
+        evidence_sig = oldest_sig_info.get("signature")
+        evidence_slot = oldest_sig_info.get("slot")
+        evidence_details = (
+            f"On-chain genesis reached naturally ({pages_fetched} page(s), {signatures_fetched} sig(s)). "
+            f"Signature: {evidence_sig}, Slot: {evidence_slot}"
+        )
+    else:
+        # Bounded limits reached or genesis not naturally reached -> Graded Fallback
+        # Fallback 1: DEX pool creation timestamp (DexScreener pairCreatedAt)
+        dex_pool = fetch_dexscreener_pair_created_at(valid_mint)
+        if dex_pool:
+            pool_time, dex_id, pair_addr = dex_pool
+            launch_time = pool_time
+            confidence = ConfidenceEnum.MEDIUM
+            resolution_type = LaunchResolutionType.ESTIMATED_POOL_CREATION.value
+            evidence_details = (
+                f"Bounded search stopped ({termination_reason}, {signatures_fetched} sigs examined). "
+                f"Estimated via first DEX liquidity pool on {dex_id} (pair: {pair_addr}) at {pool_time} UTC"
+            )
+        elif oldest_sig_info and oldest_sig_info.get("blockTime") is not None:
+            # Fallback 2: Oldest signature seen within bounded window
+            launch_time = int(oldest_sig_info["blockTime"])
+            confidence = ConfidenceEnum.LOW
+            resolution_type = LaunchResolutionType.BOUNDED_OLDEST_SIGNATURE.value
+            evidence_sig = oldest_sig_info.get("signature")
+            evidence_slot = oldest_sig_info.get("slot")
+            evidence_details = (
+                f"Bounded search stopped ({termination_reason}). "
+                f"Oldest signature in bounded window ({signatures_fetched} sigs examined). "
+                f"Earlier transactions exist on-chain."
+            )
+        else:
+            # Fallback 3: No valid timestamp found
+            launch_time = None
+            confidence = ConfidenceEnum.LOW
+            resolution_type = LaunchResolutionType.UNKNOWN.value
+            evidence_details = f"No signatures or pool data found ({termination_reason})."
+
+    total_elapsed = round(time.time() - start_time, 3)
 
     # Update or persist token with newly resolved launch time
     token_record = active_db.get_token(valid_mint)
     if token_record:
         token_record.launch_time = launch_time
-        token_record.launch_confidence = ConfidenceEnum(launch_confidence)
+        token_record.launch_confidence = confidence
         active_db.save_token(token_record)
     else:
         # Create minimal record if metadata hasn't been fetched yet
         new_token = TokenMetadata(
             token_address=valid_mint,
             launch_time=launch_time,
-            launch_confidence=ConfidenceEnum(launch_confidence),
+            launch_confidence=confidence,
         )
         active_db.save_token(new_token)
 
-    return launch_time, launch_confidence
+    resolution = LaunchTimeResolution(
+        token_address=valid_mint,
+        launch_time=launch_time,
+        confidence=confidence,
+        resolution_type=resolution_type,
+        evidence_signature=evidence_sig,
+        evidence_slot=evidence_slot,
+        evidence_details=evidence_details,
+        pages_fetched=pages_fetched,
+        signatures_fetched=signatures_fetched,
+        elapsed_seconds=total_elapsed,
+        termination_reason=termination_reason,
+    )
+
+    logger.info(
+        f"Launch time resolved for {valid_mint}: time={launch_time}, "
+        f"confidence={confidence.value}, type={resolution_type}, "
+        f"sigs={signatures_fetched}, elapsed={total_elapsed}s, reason={termination_reason}"
+    )
+
+    return resolution

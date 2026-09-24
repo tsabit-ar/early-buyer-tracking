@@ -172,6 +172,9 @@ class Database:
                 ("funding_amount_sol", "REAL"),
                 ("funding_signature", "TEXT"),
                 ("cluster_id", "TEXT"),
+                ("lifecycle_history_complete", "INTEGER DEFAULT 1"),
+                ("lifecycle_signature_count", "INTEGER DEFAULT 0"),
+                ("balance_reconciliation_status", "TEXT DEFAULT 'MATCH'"),
             ]
             for col, col_type in new_columns:
                 try:
@@ -440,9 +443,10 @@ class Database:
                     sell_count, total_sell_amount, current_holding, exit_ratio,
                     holder_rank, holder_percentage, score, confidence, is_same_block_sniper,
                     funder_address, funder_type, wallet_age_days, is_fresh, funding_amount_sol,
-                    funding_signature, cluster_id
+                    funding_signature, cluster_id, lifecycle_history_complete, lifecycle_signature_count,
+                    balance_reconciliation_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(wallet_address, token_address) DO UPDATE SET
                     first_buy_time = excluded.first_buy_time,
                     first_buy_slot = excluded.first_buy_slot,
@@ -466,7 +470,10 @@ class Database:
                     is_fresh = excluded.is_fresh,
                     funding_amount_sol = excluded.funding_amount_sol,
                     funding_signature = excluded.funding_signature,
-                    cluster_id = excluded.cluster_id;
+                    cluster_id = excluded.cluster_id,
+                    lifecycle_history_complete = excluded.lifecycle_history_complete,
+                    lifecycle_signature_count = excluded.lifecycle_signature_count,
+                    balance_reconciliation_status = excluded.balance_reconciliation_status;
                 """,
                 (
                     profile.wallet_address,
@@ -494,6 +501,9 @@ class Database:
                     profile.funding_amount_sol,
                     profile.funding_signature,
                     profile.cluster_id,
+                    1 if profile.lifecycle_history_complete else 0,
+                    profile.lifecycle_signature_count,
+                    profile.balance_reconciliation_status,
                 ),
             )
 

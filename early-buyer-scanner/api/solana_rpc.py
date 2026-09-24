@@ -300,7 +300,19 @@ class SolanaRpcClient:
             owner = po.get("owner") or pr.get("owner") or ""
             mint = po.get("mint") or pr.get("mint") or ""
             ui_pre = pr.get("uiTokenAmount", {}).get("uiAmount")
+            if ui_pre is None and pr.get("uiTokenAmount", {}).get("uiAmountString"):
+                try:
+                    ui_pre = float(pr["uiTokenAmount"]["uiAmountString"])
+                except (ValueError, TypeError):
+                    ui_pre = None
+
             ui_post = po.get("uiTokenAmount", {}).get("uiAmount")
+            if ui_post is None and po.get("uiTokenAmount", {}).get("uiAmountString"):
+                try:
+                    ui_post = float(po["uiTokenAmount"]["uiAmountString"])
+                except (ValueError, TypeError):
+                    ui_post = None
+
             pre_amt = float(ui_pre) if ui_pre is not None else 0.0
             post_amt = float(ui_post) if ui_post is not None else 0.0
             diff = post_amt - pre_amt
@@ -309,15 +321,32 @@ class SolanaRpcClient:
                 or pr.get("uiTokenAmount", {}).get("decimals")
                 or 9
             )
+            try:
+                decs_int = int(decs)
+            except (ValueError, TypeError):
+                decs_int = 9
+
             if diff != 0:
-                token_changes.append({
+                is_ui = bool(ui_pre is not None or ui_post is not None)
+                tc_entry: Dict[str, Any] = {
                     "address": owner,
                     "token_address": mint,
                     "pre_balance": pre_amt,
                     "post_balance": post_amt,
                     "change": diff,
-                    "decimals": decs,
-                })
+                    "decimals": decs_int,
+                    "is_ui_amount": is_ui,
+                    "ui_amount": diff if is_ui else None,
+                }
+                if not is_ui:
+                    raw_pr_str = pr.get("uiTokenAmount", {}).get("amount", "0")
+                    raw_po_str = po.get("uiTokenAmount", {}).get("amount", "0")
+                    try:
+                        raw_diff = int(raw_po_str) - int(raw_pr_str)
+                    except (ValueError, TypeError):
+                        raw_diff = 0
+                    tc_entry["raw_amount"] = raw_diff
+                token_changes.append(tc_entry)
 
         # Extract all programs involved
         programs = []

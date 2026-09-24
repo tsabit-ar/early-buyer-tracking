@@ -27,6 +27,7 @@ from analyzers.transaction_classifier import classify_transaction
 from analyzers.wallet_analyzer import build_buyer_profile, format_time_delta, tag_same_block_snipers
 from api.solana_rpc import SolanaRpcClient
 from api.solscan import SolscanClient
+from collectors.candidate_lifecycle import fetch_candidate_lifecycle_signatures
 from collectors.holders import get_token_holders_data
 from collectors.token import fetch_token_metadata, resolve_launch_time, validate_solana_address
 from collectors.transfers import collect_historical_transfers
@@ -195,13 +196,15 @@ def export_reports(
     output_dir: Path,
     export_csv_flag: bool,
     export_json_flag: bool,
+    csv_filename: Optional[str] = None,
 ) -> None:
     """Save ranked early buyers to CSV and JSON reports."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Export CSV
     if export_csv_flag:
-        csv_path = output_dir / "buyers.csv"
+        target_name = csv_filename or "buyers.csv"
+        csv_path = output_dir / target_name
         with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -227,6 +230,28 @@ def export_reports(
                 "Confidence",
                 "Is Sniper",
                 "First Buy Signature",
+                "Lifecycle Complete",
+                "Lifecycle Truncated",
+                "Reconciliation Status",
+                "Reconciliation Difference",
+                "Transfer In Amount",
+                "Transfer Out Amount",
+                "Net Transfer Amount",
+                "Burn Amount",
+                "Unknown In Amount",
+                "Unknown Out Amount",
+                "Unknown Transaction Count",
+                "ATA Signatures Count",
+                "Lifecycle Pages Fetched",
+                "Last Cursor Signature",
+                "Truncation Reason",
+                "Candidate Discovery Complete",
+                "Candidate Discovery Truncated",
+                "Genesis Reached",
+                "Discovery Source",
+                "Oldest Discovered Time",
+                "Discovery Termination Reason",
+                "In Early Window",
             ])
             for rank, (p, _) in enumerate(ranked_buyers, start=1):
                 writer.writerow([
@@ -252,6 +277,28 @@ def export_reports(
                     p.confidence.value,
                     "YES" if p.is_same_block_sniper else "NO",
                     p.first_buy_signature or "",
+                    "YES" if p.lifecycle_history_complete else "NO",
+                    "YES" if p.lifecycle_truncated else "NO",
+                    p.balance_reconciliation_status,
+                    p.reconciliation_difference,
+                    p.transfer_in_amount,
+                    p.transfer_out_amount,
+                    p.net_transfer_amount,
+                    p.burn_amount,
+                    p.unknown_in_amount,
+                    p.unknown_outflow_amount,
+                    p.unknown_tx_count,
+                    p.lifecycle_signature_count,
+                    p.lifecycle_pages_fetched,
+                    p.last_cursor_signature or "",
+                    p.truncation_reason or "",
+                    "YES" if p.candidate_discovery_complete else "NO",
+                    "YES" if p.candidate_discovery_truncated else "NO",
+                    "YES" if p.genesis_reached else "NO",
+                    p.discovery_source,
+                    p.oldest_discovered_block_time or "",
+                    p.discovery_termination_reason or "",
+                    "YES" if p.is_in_early_window else "NO",
                 ])
         logger.info(f"CSV report exported to: {csv_path.resolve()}")
 
@@ -495,6 +542,7 @@ def run_pipeline(
     export_csv_flag: bool = True,
     export_json_flag: bool = True,
     output_dir: Path = Path("output"),
+    csv_filename: Optional[str] = None,
 ) -> None:
     """Execute live scanner pipeline for a given token mint."""
     valid_mint = validate_solana_address(mint_address)
@@ -539,28 +587,41 @@ def run_pipeline(
     logger.info("Step 6: Fetching current token holder statistics...")
     holders_map = get_token_holders_data(valid_mint, client=client, db=db)
 
-    # 7. Collect transaction details for historical signatures involving candidates
+    # 7. Collect candidate lifecycle signatures via their ATAs (Bug 1 Fix)
     candidate_set = set(candidates)
     candidate_events = [
         e for e in transfers
         if e.to_address in candidate_set or e.from_address in candidate_set
     ]
-    signatures_to_inspect = list({e.signature for e in candidate_events if e.signature})
-    logger.info(f"Step 7: Inspecting on-chain transaction details for {len(signatures_to_inspect)} signatures...")
+    initial_transfer_sigs = {e.signature for e in candidate_events if e.signature}
+
+    logger.info(f"Step 7: Tracing complete token lifecycle signatures via candidate ATAs for {len(candidates)} wallets...")
+    lifecycle_map = fetch_candidate_lifecycle_signatures(
+        client=client,
+        candidate_wallets=candidates,
+        token_mint=valid_mint,
+        max_signatures_per_ata=500,
+    )
+
+    all_lifecycle_sigs = {sig for info in lifecycle_map.values() for sig in info.signatures}
+    signatures_to_inspect = list(initial_transfer_sigs | all_lifecycle_sigs)
+    logger.info(f"Inspecting on-chain transaction details for {len(signatures_to_inspect)} total signatures (initial + ATA lifecycle)...")
     tx_details = get_transaction_details_batch(signatures_to_inspect, client=client, db=db)
     tx_detail_map = {tx.signature: tx for tx in tx_details}
 
-    # 8. Classify transactions (Evidence First) for both BUYs and SELLs
-    logger.info("Step 8: Classifying transactions (BUY/SELL/TRANSFER/DISTRIBUTION)...")
+    # 8. Classify transactions (Evidence First) for complete candidate lifecycle
+    logger.info("Step 8: Classifying candidate transactions (BUY/SELL/TRANSFER/DISTRIBUTION)...")
     all_classifications: List[TransactionClassification] = []
     for wallet in candidates:
-        wallet_events = [e for e in candidate_events if e.to_address == wallet or e.from_address == wallet]
-        seen_sigs = set()
-        for event in wallet_events:
-            if event.signature in seen_sigs:
-                continue
-            seen_sigs.add(event.signature)
-            tx_detail = tx_detail_map.get(event.signature)
+        w_lifecycle_sigs = set(lifecycle_map[wallet].signatures) if wallet in lifecycle_map else set()
+        w_transfer_sigs = {e.signature for e in candidate_events if (e.to_address == wallet or e.from_address == wallet) and e.signature}
+        combined_wallet_sigs = list(w_lifecycle_sigs | w_transfer_sigs)
+
+        # Sort signatures chronologically
+        combined_wallet_sigs.sort(key=lambda s: (tx_detail_map[s].slot or 0, tx_detail_map[s].block_time or 0) if s in tx_detail_map else (0, 0))
+
+        for sig in combined_wallet_sigs:
+            tx_detail = tx_detail_map.get(sig)
             if not tx_detail:
                 continue
             classified = classify_transaction(
@@ -603,11 +664,55 @@ def run_pipeline(
             holder_data=holder_info,
         )
         if profile:
+            info = lifecycle_map.get(wallet)
+            if info:
+                profile.lifecycle_history_complete = info.lifecycle_history_complete
+                profile.lifecycle_signature_count = info.lifecycle_signature_count
+                profile.lifecycle_atas = info.lifecycle_atas
+
             enrich_profile_with_sells(profile, wallet_txs)
+
+            # Candidate Discovery Metadata & Safety Rules
+            profile.candidate_discovery_complete = getattr(transfers, "candidate_discovery_complete", True)
+            profile.candidate_discovery_truncated = getattr(transfers, "candidate_discovery_truncated", False)
+            profile.genesis_reached = getattr(transfers, "genesis_reached", True)
+            profile.discovery_source = getattr(transfers, "discovery_source", "UNKNOWN")
+            profile.discovery_pages_fetched = getattr(transfers, "discovery_pages_fetched", 0)
+            profile.discovery_signatures_fetched = getattr(transfers, "discovery_signatures_fetched", 0)
+            profile.oldest_discovered_block_time = getattr(transfers, "oldest_discovered_block_time", None)
+            profile.oldest_discovered_slot = getattr(transfers, "oldest_discovered_slot", None)
+            profile.discovery_termination_reason = getattr(transfers, "discovery_termination_reason", None)
+            profile.early_window_hours = 24.0
+
+            if token.launch_time is not None and profile.first_buy_time is not None:
+                profile.is_in_early_window = bool(
+                    profile.first_buy_time <= token.launch_time + int(24.0 * 3600)
+                )
+            else:
+                profile.is_in_early_window = profile.candidate_discovery_complete
+
+            if profile.candidate_discovery_complete:
+                profile.candidate_discovery_status = "COMPLETE"
+            else:
+                profile.candidate_discovery_status = "DISCOVERY_INCOMPLETE"
+                # Safety rule: if candidate discovery is incomplete, do NOT assign HIGH confidence
+                if profile.confidence == ConfidenceEnum.HIGH:
+                    profile.confidence = ConfidenceEnum.MEDIUM
+
             buyer_profiles.append(profile)
 
     buyer_profiles = tag_same_block_snipers(buyer_profiles)
-    logger.info(f"Identified {len(buyer_profiles)} verified early buyers.")
+    # If candidate discovery was incomplete, suppress sniper tags
+    if not getattr(transfers, "candidate_discovery_complete", True):
+        for p in buyer_profiles:
+            p.is_same_block_sniper = False
+        logger.warning(
+            f"Candidate discovery INCOMPLETE for {valid_mint} "
+            f"(Source: {getattr(transfers, 'discovery_source', 'UNKNOWN')}, "
+            f"Reason: {getattr(transfers, 'discovery_termination_reason', 'UNKNOWN')}). "
+            "Early buyers may be missing from ledger history."
+        )
+    logger.info(f"Identified {len(buyer_profiles)} early buyer candidates.")
 
     # 10. Trace initial SOL funding & detect Sybil clusters
     logger.info(f"Step 10: Tracing initial SOL funding and detecting Sybil clusters for {len(buyer_profiles)} buyers...")
@@ -652,6 +757,7 @@ def run_pipeline(
         output_dir=output_dir,
         export_csv_flag=export_csv_flag,
         export_json_flag=export_json_flag,
+        csv_filename=csv_filename,
     )
 
 
@@ -690,6 +796,12 @@ def main() -> None:
         help="Directory to save exported reports (default: output)",
     )
     parser.add_argument(
+        "--csv-name",
+        type=str,
+        default=None,
+        help="Custom filename for exported CSV (default: buyers.csv)",
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="Run offline demonstration pipeline using pre-crafted on-chain fixtures",
@@ -717,6 +829,7 @@ def main() -> None:
             export_csv_flag=args.export_csv,
             export_json_flag=args.export_json,
             output_dir=out_dir,
+            csv_filename=args.csv_name,
         )
 
 
