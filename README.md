@@ -1,6 +1,6 @@
 # Early Buyer Tracking / Scanner (EBRS)
 
-Solana On-Chain Early Buyer Detection & Ranking System based on Product Requirements Document (PRD).
+Solana On-Chain Early Buyer Detection & Ranking System.
 
 ## Core Principles
 1. **Evidence First, Score Second**: Never assume a transaction is a BUY without verifying quote asset (SOL/WSOL) outflows, token balance inflows, and DEX/AMM program involvement.
