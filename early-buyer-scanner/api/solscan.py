@@ -176,6 +176,62 @@ class SolscanClient:
         }
         return self.get("token/transfer", params)
 
+    def get_playground_token_transfers(
+        self,
+        token_address: str,
+        page: int = 1,
+        page_size: int = 10,
+        sort_by: str = "block_time",
+        sort_order: str = "asc",
+    ) -> Dict[str, Any]:
+        """Fetch historical token transfers from Solscan Playground endpoint (/playground/token/transfer).
+        
+        Strictly for FREE_LIMITED mode within local safety budgets.
+        Follows cache-first with SQLite and handles 429/401/400 without aggressive/infinite retries.
+        """
+        params = {
+            "address": token_address,
+            "page": page,
+            "page_size": page_size,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        }
+        endpoint = "playground/token/transfer"
+        cache_key = compute_cache_key(endpoint, params)
+
+        # 1. Check local SQLite cache first
+        cached = self.db.get_cached_response(cache_key)
+        if cached is not None:
+            logger.debug(f"Cache hit for {endpoint} with key {cache_key}")
+            return cached
+
+        # 2. Cache miss: Fetch from Solscan Playground
+        playground_base = getattr(settings, "free_playground_base_url", "https://pro-api.solscan.io/playground").rstrip("/")
+        url = f"{playground_base}/token/transfer"
+
+        self._throttle()
+        try:
+            response = self.client.get(url, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                self.db.set_cached_response(cache_key, endpoint, params, data)
+                return data
+            elif response.status_code == 429:
+                logger.warning("Solscan Playground rate limited (HTTP 429). Halting playground requests.")
+                raise SolscanAPIError("Solscan Playground rate limited (HTTP 429)", status_code=429, response_text=response.text)
+            elif response.status_code == 401:
+                logger.warning("Solscan Playground authentication rejected (HTTP 401).")
+                raise SolscanAPIError("Solscan Playground unauthorized (HTTP 401)", status_code=401, response_text=response.text)
+            elif response.status_code == 400:
+                logger.warning(f"Solscan Playground validation error (HTTP 400): {response.text}")
+                raise SolscanAPIError(f"Solscan Playground validation error (HTTP 400): {response.text}", status_code=400, response_text=response.text)
+            else:
+                logger.warning(f"Solscan Playground error HTTP {response.status_code}: {response.text}")
+                raise SolscanAPIError(f"Solscan Playground error HTTP {response.status_code}", status_code=response.status_code, response_text=response.text)
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            logger.warning(f"Network error on Solscan Playground: {exc}")
+            raise SolscanAPIError(f"Network error on Solscan Playground: {exc}") from exc
+
     def get_token_holders(
         self,
         token_address: str,

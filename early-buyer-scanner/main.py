@@ -37,6 +37,9 @@ from models.schemas import (
     BalanceChange,
     ClassificationEnum,
     ConfidenceEnum,
+    LaunchResolutionType,
+    EarlyWindowBasisEnum,
+    EarlyWindowStatusEnum,
     ScannerReport,
     ScoreBreakdown,
     TokenMetadata,
@@ -87,6 +90,15 @@ def print_executive_report(
     print(f"\nLaunch:\n{launch_str}")
     print(f"\nCandidates:\n{candidates_count}")
     print(f"\nLikely Buyers:\n{len(ranked_buyers)}")
+
+    has_free_limited = any(getattr(p, "discovery_mode", "") == "FREE_LIMITED" for p, _ in ranked_buyers)
+    is_incomplete = any(not getattr(p, "candidate_discovery_complete", True) for p, _ in ranked_buyers)
+    if has_free_limited or is_incomplete:
+        print("\n" + "!" * 90)
+        print("WARNING: Limited discovery: historical scan did not prove complete coverage.")
+        print("         Early-buyer results represent only the observed historical window.")
+        print("!" * 90)
+
     print("\n" + "-" * 90)
     print(f"{'RANK':<5} {'WALLET':<12} {'FIRST BUY':<11} {'SIZE':<10} {'HOLD':<6} {'AGE':<12} {'FUNDER':<18} {'SCORE':<6} {'TAG':<8}")
     print("-" * 90)
@@ -249,9 +261,13 @@ def export_reports(
                 "Candidate Discovery Truncated",
                 "Genesis Reached",
                 "Discovery Source",
+                "Discovery Mode",
                 "Oldest Discovered Time",
                 "Discovery Termination Reason",
                 "In Early Window",
+                "Launch Time Type",
+                "Early Window Basis",
+                "Early Window Status",
             ])
             for rank, (p, _) in enumerate(ranked_buyers, start=1):
                 writer.writerow([
@@ -296,9 +312,13 @@ def export_reports(
                     "YES" if p.candidate_discovery_truncated else "NO",
                     "YES" if p.genesis_reached else "NO",
                     p.discovery_source,
+                    p.discovery_mode,
                     p.oldest_discovered_block_time or "",
                     p.discovery_termination_reason or "",
                     "YES" if p.is_in_early_window else "NO",
+                    p.launch_time_type,
+                    p.early_window_basis,
+                    p.early_window_status,
                 ])
         logger.info(f"CSV report exported to: {csv_path.resolve()}")
 
@@ -543,6 +563,7 @@ def run_pipeline(
     export_json_flag: bool = True,
     output_dir: Path = Path("output"),
     csv_filename: Optional[str] = None,
+    discovery_mode: Optional[str] = None,
 ) -> None:
     """Execute live scanner pipeline for a given token mint."""
     valid_mint = validate_solana_address(mint_address)
@@ -557,9 +578,14 @@ def run_pipeline(
 
     # 2. Resolve token launch time
     logger.info("Step 2: Resolving token launch timestamp...")
-    launch_time, launch_conf = resolve_launch_time(valid_mint, client=client, db=db)
-    token.launch_time = launch_time
-    token.launch_confidence = ConfidenceEnum(launch_conf)
+    launch_res = resolve_launch_time(valid_mint, client=client, db=db)
+    token.launch_time = launch_res.launch_time
+    token.launch_confidence = (
+        launch_res.confidence
+        if isinstance(launch_res.confidence, ConfidenceEnum)
+        else ConfidenceEnum(launch_res.confidence)
+    )
+    token.launch_time_type = getattr(launch_res, "resolution_type", LaunchResolutionType.UNKNOWN.value)
 
     # 3. Collect historical transfers
     logger.info(f"Step 3: Collecting historical token transfers (max: {max_transfers})...")
@@ -568,6 +594,7 @@ def run_pipeline(
         max_transfers=max_transfers,
         client=client,
         db=db,
+        discovery_mode=discovery_mode,
     )
     logger.info(f"Retrieved {len(transfers)} historical transfer events.")
 
@@ -677,19 +704,45 @@ def run_pipeline(
             profile.candidate_discovery_truncated = getattr(transfers, "candidate_discovery_truncated", False)
             profile.genesis_reached = getattr(transfers, "genesis_reached", True)
             profile.discovery_source = getattr(transfers, "discovery_source", "UNKNOWN")
+            profile.discovery_mode = getattr(transfers, "discovery_mode", "PRODUCTION")
             profile.discovery_pages_fetched = getattr(transfers, "discovery_pages_fetched", 0)
             profile.discovery_signatures_fetched = getattr(transfers, "discovery_signatures_fetched", 0)
             profile.oldest_discovered_block_time = getattr(transfers, "oldest_discovered_block_time", None)
             profile.oldest_discovered_slot = getattr(transfers, "oldest_discovered_slot", None)
             profile.discovery_termination_reason = getattr(transfers, "discovery_termination_reason", None)
             profile.early_window_hours = 24.0
+            profile.launch_time_type = getattr(token, "launch_time_type", LaunchResolutionType.UNKNOWN.value)
+
+            # Determine early_window_basis according to launch_time evidence type
+            if profile.launch_time_type == LaunchResolutionType.EXACT_GENESIS.value:
+                profile.early_window_basis = EarlyWindowBasisEnum.EXACT_GENESIS_WINDOW.value
+            elif profile.launch_time_type == LaunchResolutionType.ESTIMATED_POOL_CREATION.value:
+                profile.early_window_basis = EarlyWindowBasisEnum.ESTIMATED_LAUNCH_WINDOW.value
+            elif profile.launch_time_type == LaunchResolutionType.BOUNDED_OLDEST_SIGNATURE.value:
+                profile.early_window_basis = EarlyWindowBasisEnum.BOUNDED_DISCOVERY_WINDOW.value
+            else:
+                profile.early_window_basis = EarlyWindowBasisEnum.UNKNOWN.value
 
             if token.launch_time is not None and profile.first_buy_time is not None:
                 profile.is_in_early_window = bool(
-                    profile.first_buy_time <= token.launch_time + int(24.0 * 3600)
+                    profile.first_buy_time <= token.launch_time + int(profile.early_window_hours * 3600)
                 )
             else:
-                profile.is_in_early_window = profile.candidate_discovery_complete
+                profile.is_in_early_window = bool(profile.candidate_discovery_complete)
+
+            # Determine early_window_status (Anti-false-certainty rule)
+            if profile.is_in_early_window:
+                if (
+                    profile.early_window_basis == EarlyWindowBasisEnum.EXACT_GENESIS_WINDOW.value
+                    and profile.candidate_discovery_complete
+                ):
+                    profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_CONFIRMED.value
+                elif profile.early_window_basis == EarlyWindowBasisEnum.ESTIMATED_LAUNCH_WINDOW.value:
+                    profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_ESTIMATED.value
+                else:
+                    profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_UNVERIFIED.value
+            else:
+                profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_UNVERIFIED.value
 
             if profile.candidate_discovery_complete:
                 profile.candidate_discovery_status = "COMPLETE"
@@ -802,6 +855,13 @@ def main() -> None:
         help="Custom filename for exported CSV (default: buyers.csv)",
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["PRODUCTION", "FREE_LIMITED"],
+        default=settings.discovery_mode,
+        help="Candidate discovery mode: PRODUCTION or FREE_LIMITED (default: from DISCOVERY_MODE or PRODUCTION)",
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="Run offline demonstration pipeline using pre-crafted on-chain fixtures",
@@ -830,6 +890,7 @@ def main() -> None:
             export_json_flag=args.export_json,
             output_dir=out_dir,
             csv_filename=args.csv_name,
+            discovery_mode=args.mode,
         )
 
 

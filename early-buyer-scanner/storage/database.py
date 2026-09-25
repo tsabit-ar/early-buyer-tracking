@@ -100,10 +100,16 @@ class Database:
                     creator TEXT,
                     launch_time INTEGER,
                     launch_confidence TEXT,
+                    launch_time_type TEXT DEFAULT 'UNKNOWN',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """
             )
+            # Ensure launch_time_type column exists if table was already created
+            cursor.execute("PRAGMA table_info(tokens);")
+            token_cols = [c[1] for c in cursor.fetchall()]
+            if "launch_time_type" not in token_cols:
+                cursor.execute("ALTER TABLE tokens ADD COLUMN launch_time_type TEXT DEFAULT 'UNKNOWN';")
 
             # Table 2: transactions (PRD 11)
             cursor.execute(
@@ -292,18 +298,24 @@ class Database:
             if isinstance(token.launch_confidence, ConfidenceEnum)
             else str(token.launch_confidence)
         )
+        launch_type_val = (
+            token.launch_time_type.value
+            if hasattr(token.launch_time_type, "value")
+            else str(token.launch_time_type or "UNKNOWN")
+        )
         with self.transaction() as cursor:
             cursor.execute(
                 """
-                INSERT INTO tokens (token_address, name, symbol, decimals, creator, launch_time, launch_confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tokens (token_address, name, symbol, decimals, creator, launch_time, launch_confidence, launch_time_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(token_address) DO UPDATE SET
                     name = excluded.name,
                     symbol = excluded.symbol,
                     decimals = excluded.decimals,
                     creator = excluded.creator,
                     launch_time = excluded.launch_time,
-                    launch_confidence = excluded.launch_confidence;
+                    launch_confidence = excluded.launch_confidence,
+                    launch_time_type = excluded.launch_time_type;
                 """,
                 (
                     token.token_address,
@@ -313,6 +325,7 @@ class Database:
                     token.creator,
                     token.launch_time,
                     confidence_val,
+                    launch_type_val,
                 ),
             )
 
@@ -322,7 +335,7 @@ class Database:
         cursor = conn.cursor()
         try:
             cursor.execute(
-                "SELECT token_address, name, symbol, decimals, creator, launch_time, launch_confidence, created_at "
+                "SELECT token_address, name, symbol, decimals, creator, launch_time, launch_confidence, launch_time_type, created_at "
                 "FROM tokens WHERE token_address = ?;",
                 (token_address,),
             )
@@ -339,6 +352,7 @@ class Database:
                 launch_confidence=ConfidenceEnum(row["launch_confidence"])
                 if row["launch_confidence"]
                 else ConfidenceEnum.LOW,
+                launch_time_type=row["launch_time_type"] if "launch_time_type" in row.keys() and row["launch_time_type"] else "UNKNOWN",
                 created_at=str(row["created_at"]),
             )
         finally:

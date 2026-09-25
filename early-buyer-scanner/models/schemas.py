@@ -42,9 +42,31 @@ class LaunchResolutionType(str, Enum):
 class DiscoverySourceEnum(str, Enum):
     """Source of candidate discovery transfers (Phase 3)."""
     SOLSCAN_ASC = "SOLSCAN_ASC"
+    SOLSCAN_PLAYGROUND = "SOLSCAN_PLAYGROUND"
     NATIVE_RPC_GENESIS = "NATIVE_RPC_GENESIS"
     NATIVE_RPC_BOUNDED = "NATIVE_RPC_BOUNDED"
     UNKNOWN = "UNKNOWN"
+
+
+class DiscoveryModeEnum(str, Enum):
+    """Runtime candidate discovery mode."""
+    PRODUCTION = "PRODUCTION"
+    FREE_LIMITED = "FREE_LIMITED"
+
+
+class EarlyWindowBasisEnum(str, Enum):
+    """Basis for early window calculation."""
+    EXACT_GENESIS_WINDOW = "EXACT_GENESIS_WINDOW"
+    ESTIMATED_LAUNCH_WINDOW = "ESTIMATED_LAUNCH_WINDOW"
+    BOUNDED_DISCOVERY_WINDOW = "BOUNDED_DISCOVERY_WINDOW"
+    UNKNOWN = "UNKNOWN"
+
+
+class EarlyWindowStatusEnum(str, Enum):
+    """Status of early window qualification."""
+    EARLY_WINDOW_CONFIRMED = "EARLY_WINDOW_CONFIRMED"
+    EARLY_WINDOW_ESTIMATED = "EARLY_WINDOW_ESTIMATED"
+    EARLY_WINDOW_UNVERIFIED = "EARLY_WINDOW_UNVERIFIED"
 
 
 class LaunchTimeResolution(BaseModel):
@@ -99,6 +121,10 @@ class TokenMetadata(BaseModel):
     launch_confidence: ConfidenceEnum = Field(
         default=ConfidenceEnum.LOW,
         description="Confidence of detected launch time"
+    )
+    launch_time_type: str = Field(
+        default=LaunchResolutionType.UNKNOWN.value,
+        description="Resolution method of launch time: EXACT_GENESIS, ESTIMATED_POOL_CREATION, etc."
     )
     created_at: Optional[str] = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
@@ -226,6 +252,7 @@ class WalletProfile(BaseModel):
     candidate_discovery_truncated: bool = Field(default=False, description="Whether candidate discovery was cut off before genesis")
     genesis_reached: bool = Field(default=True, description="Whether token genesis block was reached during candidate discovery")
     discovery_source: str = Field(default=DiscoverySourceEnum.UNKNOWN.value, description="Source of candidate discovery")
+    discovery_mode: str = Field(default="PRODUCTION", description="Runtime discovery mode: PRODUCTION or FREE_LIMITED")
     discovery_pages_fetched: int = Field(default=0, ge=0, description="Pages fetched during candidate discovery")
     discovery_signatures_fetched: int = Field(default=0, ge=0, description="Signatures fetched during candidate discovery")
     oldest_discovered_block_time: Optional[int] = Field(default=None, description="Block time of oldest discovered transaction")
@@ -234,6 +261,18 @@ class WalletProfile(BaseModel):
     candidate_discovery_status: str = Field(default="COMPLETE", description="COMPLETE or DISCOVERY_INCOMPLETE")
     is_in_early_window: bool = Field(default=True, description="Whether first buy falls within early window hours from launch")
     early_window_hours: float = Field(default=24.0, description="Configured early window in hours")
+    launch_time_type: str = Field(
+        default=LaunchResolutionType.UNKNOWN.value,
+        description="Resolution method of launch time: EXACT_GENESIS, ESTIMATED_POOL_CREATION, etc."
+    )
+    early_window_basis: str = Field(
+        default=EarlyWindowBasisEnum.UNKNOWN.value,
+        description="Basis for early window calculation: EXACT_GENESIS_WINDOW, ESTIMATED_LAUNCH_WINDOW, etc."
+    )
+    early_window_status: str = Field(
+        default=EarlyWindowStatusEnum.EARLY_WINDOW_UNVERIFIED.value,
+        description="Qualification status: EARLY_WINDOW_CONFIRMED, EARLY_WINDOW_ESTIMATED, EARLY_WINDOW_UNVERIFIED"
+    )
     evidence_signatures: List[str] = Field(default_factory=list, description="Transaction signatures supporting this profile")
 
     @field_validator("exit_ratio")

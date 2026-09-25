@@ -36,6 +36,9 @@ from collectors.transactions import get_transaction_details_batch
 from config import KNOWN_CEX_WALLETS, settings
 from models.schemas import (
     ConfidenceEnum,
+    LaunchResolutionType,
+    EarlyWindowBasisEnum,
+    EarlyWindowStatusEnum,
     ScannerReport,
     ScoreBreakdown,
     TokenMetadata,
@@ -136,7 +139,7 @@ def format_funder_str(funder_address: Optional[str], funder_type: str, cluster_i
     return "-"
 
 
-def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
+def execute_pipeline(mint_address: str, max_transfers: int, discovery_mode: str = "PRODUCTION") -> Dict[str, Any]:
     """Execute EBRS on-chain pipeline with step-by-step UI progress updates."""
     valid_mint = validate_solana_address(mint_address)
     db = Database(settings.sqlite_db_path)
@@ -149,9 +152,14 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
 
         # Step 2: Genesis launch time
         status.update(label="2/7 Menentukan waktu peluncuran genesis absolut (UTC)...", state="running")
-        launch_time, launch_conf = resolve_launch_time(valid_mint, client=client, db=db)
-        token.launch_time = launch_time
-        token.launch_confidence = ConfidenceEnum(launch_conf)
+        launch_res = resolve_launch_time(valid_mint, client=client, db=db)
+        token.launch_time = launch_res.launch_time
+        token.launch_confidence = (
+            launch_res.confidence
+            if isinstance(launch_res.confidence, ConfidenceEnum)
+            else ConfidenceEnum(launch_res.confidence)
+        )
+        token.launch_time_type = getattr(launch_res, "resolution_type", LaunchResolutionType.UNKNOWN.value)
 
         # Step 3: Historical transfers
         status.update(label=f"3/7 Mengumpulkan {max_transfers} transfer historis dari blok genesis...", state="running")
@@ -160,6 +168,7 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
             max_transfers=max_transfers,
             client=client,
             db=db,
+            discovery_mode=discovery_mode,
         )
 
         # Step 4: Filter & candidate generation
@@ -259,19 +268,45 @@ def execute_pipeline(mint_address: str, max_transfers: int) -> Dict[str, Any]:
                 profile.candidate_discovery_truncated = getattr(transfers, "candidate_discovery_truncated", False)
                 profile.genesis_reached = getattr(transfers, "genesis_reached", True)
                 profile.discovery_source = getattr(transfers, "discovery_source", "UNKNOWN")
+                profile.discovery_mode = getattr(transfers, "discovery_mode", "PRODUCTION")
                 profile.discovery_pages_fetched = getattr(transfers, "discovery_pages_fetched", 0)
                 profile.discovery_signatures_fetched = getattr(transfers, "discovery_signatures_fetched", 0)
                 profile.oldest_discovered_block_time = getattr(transfers, "oldest_discovered_block_time", None)
                 profile.oldest_discovered_slot = getattr(transfers, "oldest_discovered_slot", None)
                 profile.discovery_termination_reason = getattr(transfers, "discovery_termination_reason", None)
                 profile.early_window_hours = 24.0
+                profile.launch_time_type = getattr(token, "launch_time_type", LaunchResolutionType.UNKNOWN.value)
+
+                # Determine early_window_basis according to launch_time evidence type
+                if profile.launch_time_type == LaunchResolutionType.EXACT_GENESIS.value:
+                    profile.early_window_basis = EarlyWindowBasisEnum.EXACT_GENESIS_WINDOW.value
+                elif profile.launch_time_type == LaunchResolutionType.ESTIMATED_POOL_CREATION.value:
+                    profile.early_window_basis = EarlyWindowBasisEnum.ESTIMATED_LAUNCH_WINDOW.value
+                elif profile.launch_time_type == LaunchResolutionType.BOUNDED_OLDEST_SIGNATURE.value:
+                    profile.early_window_basis = EarlyWindowBasisEnum.BOUNDED_DISCOVERY_WINDOW.value
+                else:
+                    profile.early_window_basis = EarlyWindowBasisEnum.UNKNOWN.value
 
                 if token.launch_time is not None and profile.first_buy_time is not None:
                     profile.is_in_early_window = bool(
-                        profile.first_buy_time <= token.launch_time + int(24.0 * 3600)
+                        profile.first_buy_time <= token.launch_time + int(profile.early_window_hours * 3600)
                     )
                 else:
-                    profile.is_in_early_window = profile.candidate_discovery_complete
+                    profile.is_in_early_window = bool(profile.candidate_discovery_complete)
+
+                # Determine early_window_status (Anti-false-certainty rule)
+                if profile.is_in_early_window:
+                    if (
+                        profile.early_window_basis == EarlyWindowBasisEnum.EXACT_GENESIS_WINDOW.value
+                        and profile.candidate_discovery_complete
+                    ):
+                        profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_CONFIRMED.value
+                    elif profile.early_window_basis == EarlyWindowBasisEnum.ESTIMATED_LAUNCH_WINDOW.value:
+                        profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_ESTIMATED.value
+                    else:
+                        profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_UNVERIFIED.value
+                else:
+                    profile.early_window_status = EarlyWindowStatusEnum.EARLY_WINDOW_UNVERIFIED.value
 
                 if profile.candidate_discovery_complete:
                     profile.candidate_discovery_status = "COMPLETE"
@@ -368,9 +403,13 @@ def generate_csv_bytes(ranked_buyers: List[Tuple[WalletProfile, ScoreBreakdown]]
         "Candidate Discovery Truncated",
         "Genesis Reached",
         "Discovery Source",
+        "Discovery Mode",
         "Oldest Discovered Time",
         "Discovery Termination Reason",
         "In Early Window",
+        "Launch Time Type",
+        "Early Window Basis",
+        "Early Window Status",
     ])
     for rank, (p, _) in enumerate(ranked_buyers, start=1):
         writer.writerow([
@@ -415,9 +454,13 @@ def generate_csv_bytes(ranked_buyers: List[Tuple[WalletProfile, ScoreBreakdown]]
             "YES" if p.candidate_discovery_truncated else "NO",
             "YES" if p.genesis_reached else "NO",
             p.discovery_source,
+            getattr(p, "discovery_mode", "PRODUCTION"),
             p.oldest_discovered_block_time or "",
             p.discovery_termination_reason or "",
             "YES" if p.is_in_early_window else "NO",
+            p.launch_time_type,
+            p.early_window_basis,
+            p.early_window_status,
         ])
     return output.getvalue().encode("utf-8")
 
@@ -441,6 +484,12 @@ def generate_json_bytes(token: TokenMetadata, candidates_count: int, ranked_buye
 st.sidebar.markdown("### ⚙️ Parameter Pemindaian")
 default_mint = "7uvLyn87LSxW2GdwdEeiwmSJwQLVrcVyo7SRVcLbbtGc"  # ACAT
 mint_input = st.sidebar.text_input("Solana Token Mint Address", value=default_mint, help="Masukkan Solana Base58 Mint Address (32-44 karakter)")
+mode_input = st.sidebar.selectbox(
+    "Discovery Mode",
+    options=["PRODUCTION", "FREE_LIMITED"],
+    index=0,
+    help="PRODUCTION: Menggunakan Solscan ASC API berbayar dengan fallback Native RPC.\nFREE_LIMITED: Menggunakan Solscan Playground gratis dengan fallback Native RPC.",
+)
 max_transfers_input = st.sidebar.slider("Max Transfers to Scan", min_value=10, max_value=100, value=20, step=5, help="Jumlah transfer kronologis awal dari genesis yang dianalisis")
 hide_dust_input = st.sidebar.checkbox("Sembunyikan Transaksi Debu / Dust (< 1.000 token)", value=False, help="Filter dompet dengan pembelian pertama di bawah 1.000 token")
 
@@ -464,7 +513,7 @@ st.markdown('<div class="sub-title">Evidence-First Early Buyer Ranking & Sybil C
 # Trigger scan on button click
 if scan_clicked:
     try:
-        results = execute_pipeline(mint_input, max_transfers_input)
+        results = execute_pipeline(mint_input, max_transfers_input, discovery_mode=mode_input)
         st.session_state["scan_results"] = results
         st.session_state["scanned_mint"] = mint_input
     except Exception as exc:
@@ -507,10 +556,12 @@ if "scan_results" in st.session_state:
             if token.launch_time
             else "N/A"
         )
+        is_exact = getattr(token, "launch_time_type", "") == LaunchResolutionType.EXACT_GENESIS.value
+        label_str = "Waktu Genesis Launch (On-Chain)" if is_exact else "Estimasi Launch (Pool Creation)"
         st.metric(
-            label="Waktu Genesis Launch",
+            label=label_str,
             value=launch_str,
-            help=f"Confidence: {token.launch_confidence.value}",
+            help=f"Type: {getattr(token, 'launch_time_type', 'UNKNOWN')} | Confidence: {token.launch_confidence.value}",
         )
 
     with col3:
@@ -543,13 +594,22 @@ if "scan_results" in st.session_state:
         )
 
     transfers = res.get("transfers")
+    active_mode = getattr(transfers, "discovery_mode", "PRODUCTION") if transfers else "PRODUCTION"
+    if active_mode == "FREE_LIMITED":
+        st.info(
+            "ℹ️ **Mode Aktif: FREE_LIMITED**\n\n"
+            "Pemindaian berjalan menggunakan sumber terbatas (Solscan Playground / Native RPC). "
+            "Hasil merepresentasikan jendela data historis yang berhasil diambil dan diverifikasi."
+        )
+
     if transfers is not None and not getattr(transfers, "candidate_discovery_complete", True):
         st.warning(
             f"⚠️ **PERINGATAN: Candidate discovery tidak lengkap (Incomplete Discovery).**\n\n"
+            f"• **Mode:** `{getattr(transfers, 'discovery_mode', 'PRODUCTION')}`\n"
             f"• **Alasan:** `{getattr(transfers, 'discovery_termination_reason', 'MAX_PAGES_REACHED')}`\n"
             f"• **Sumber:** `{getattr(transfers, 'discovery_source', 'NATIVE_RPC_BOUNDED')}`\n"
-            f"• **Halaman RPC:** `{getattr(transfers, 'discovery_pages_fetched', 0)}` halaman "
-            f"({getattr(transfers, 'discovery_signatures_fetched', 0)} signatures diperiksa)\n\n"
+            f"• **Halaman / Permintaan:** `{getattr(transfers, 'discovery_pages_fetched', 0)}` halaman "
+            f"({getattr(transfers, 'discovery_signatures_fetched', 0)} signatures/transfers diperiksa)\n\n"
             "**Catatan Kritis:** Riwayat genesis on-chain tidak terjangkau dalam batas pencarian. "
             "Kandidat di bawah ini teridentifikasi dari riwayat transaksi terbaru dalam batas pencarian, "
             "BUKAN pembeli awal peluncuran (genesis early buyers mungkin terlewat)."
@@ -577,6 +637,8 @@ if "scan_results" in st.session_state:
             tag_display = "[UNVERIFIED]"
         elif p.is_same_block_sniper:
             tag_display = "[SNIPER]"
+        elif p.early_window_status == EarlyWindowStatusEnum.EARLY_WINDOW_ESTIMATED.value:
+            tag_display = "[EST_WINDOW]"
 
         table_data.append({
             "Rank": rank,
@@ -590,6 +652,8 @@ if "scan_results" in st.session_state:
             "Cluster": p.cluster_id or "-",
             "Score": int(round(p.score)),
             "Tag": tag_display,
+            "Mode": getattr(p, "discovery_mode", "PRODUCTION"),
+            "Window": p.early_window_status,
             "Discovery": "COMPLETE" if p.candidate_discovery_complete else "INCOMPLETE",
             "Buy Tx": tx_explorer_link,
         })
@@ -610,6 +674,7 @@ if "scan_results" in st.session_state:
             "Cluster": st.column_config.TextColumn("Sybil Cluster", width="small"),
             "Score": st.column_config.ProgressColumn("EBRS Score", min_value=0, max_value=100, format="%d"),
             "Tag": st.column_config.TextColumn("Tag", width="small"),
+            "Mode": st.column_config.TextColumn("Mode", width="small"),
             "Buy Tx": st.column_config.LinkColumn("Evidence Tx", display_text="🔗 Tx", width="small"),
         },
         use_container_width=True,

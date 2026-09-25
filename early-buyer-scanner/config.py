@@ -207,6 +207,20 @@ class Settings:
     scoring_weights: Dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_SCORING_WEIGHTS)
     )
+    discovery_mode: str = field(
+        default_factory=lambda: os.getenv("DISCOVERY_MODE", "PRODUCTION")
+    )
+    # Local safety budget; not server-side Solscan quota.
+    free_playground_max_requests_per_run: int = field(
+        default_factory=lambda: int(os.getenv("FREE_PLAYGROUND_MAX_REQUESTS_PER_RUN", "3"))
+    )
+    # Local safety budget; not server-side Solscan quota.
+    free_playground_page_size: int = field(
+        default_factory=lambda: int(os.getenv("FREE_PLAYGROUND_PAGE_SIZE", "10"))
+    )
+    free_playground_base_url: str = field(
+        default_factory=lambda: os.getenv("FREE_PLAYGROUND_BASE_URL", "https://pro-api.solscan.io/playground")
+    )
 
 
 # Global settings singleton

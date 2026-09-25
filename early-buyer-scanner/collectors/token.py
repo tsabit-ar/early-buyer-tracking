@@ -257,6 +257,11 @@ def fetch_token_metadata(
 
     launch_time = existing.launch_time if existing else None
     launch_confidence = existing.launch_confidence if existing else ConfidenceEnum.LOW
+    launch_time_type = (
+        existing.launch_time_type
+        if existing and hasattr(existing, "launch_time_type") and existing.launch_time_type
+        else LaunchResolutionType.UNKNOWN.value
+    )
 
     metadata = TokenMetadata(
         token_address=valid_mint,
@@ -266,6 +271,7 @@ def fetch_token_metadata(
         creator=creator,
         launch_time=launch_time,
         launch_confidence=launch_confidence,
+        launch_time_type=launch_time_type,
     )
 
     active_db.save_token(metadata)
@@ -361,12 +367,17 @@ def resolve_launch_time(
                 else ConfidenceEnum(existing.launch_confidence)
             )
             conf_val = conf_enum.value
-            logger.info(f"Using cached launch time for {valid_mint}: {existing.launch_time} ({conf_val})")
+            cached_type = (
+                existing.launch_time_type
+                if getattr(existing, "launch_time_type", None) and existing.launch_time_type != LaunchResolutionType.UNKNOWN.value
+                else LaunchResolutionType.CACHED_DB.value
+            )
+            logger.info(f"Using cached launch time for {valid_mint}: {existing.launch_time} ({conf_val}, type={cached_type})")
             return LaunchTimeResolution(
                 token_address=valid_mint,
                 launch_time=existing.launch_time,
                 confidence=conf_enum,
-                resolution_type=LaunchResolutionType.CACHED_DB.value,
+                resolution_type=cached_type,
                 evidence_details="Retrieved from SQLite database cache",
                 termination_reason="CACHE_HIT",
             )
@@ -556,6 +567,7 @@ def resolve_launch_time(
     if token_record:
         token_record.launch_time = launch_time
         token_record.launch_confidence = confidence
+        token_record.launch_time_type = resolution_type
         active_db.save_token(token_record)
     else:
         # Create minimal record if metadata hasn't been fetched yet
@@ -563,6 +575,7 @@ def resolve_launch_time(
             token_address=valid_mint,
             launch_time=launch_time,
             launch_confidence=confidence,
+            launch_time_type=resolution_type,
         )
         active_db.save_token(new_token)
 
